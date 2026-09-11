@@ -1,0 +1,17 @@
+[package]
+name = "tokio_way_backends"
+version = "0.1.0"
+edition = "2024"
+description = "A Tokio-Based Wayland Backends Implementation"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["tokio", "wayland", "compositor", "backends", "render" ]
+categories = ["graphics-programming"]
+homepage = "https://github.com/mlambert125/tokio_way_backends"
+repository = "https://github.com/mlambert125/tokio_way_backends"
+
+[dependencies]
+anyhow = "1.0.100"
+tracing = { version = "0.1.41" }
+tokio = { version = "1.48", features = ["full"] }
+tokio-util = "0.7.18"
