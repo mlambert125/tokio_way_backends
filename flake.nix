@@ -22,6 +22,9 @@
       rustfmt = fenix.packages.${system}.complete.rustfmt;
     in {
       devShells.default = pkgs.mkShell {
+        nativeBuildInputs = with pkgs; [
+          pkg-config
+        ];
         buildInputs = with pkgs; [
           rust
           rust-analyzer
@@ -29,6 +32,15 @@
           clippy
           nixd
           alejandra
+          # System libraries the DRM/libinput backend links at build time.
+          # The winit backend needs none of these (glow/glutin load their
+          # symbols at runtime), so they are only here for the drm feature.
+          libdrm
+          libgbm
+          libinput
+          udev
+          seatd
+          libGL
         ];
       };
     });

@@ -6,12 +6,37 @@ description = "A Tokio-Based Wayland Backends Implementation"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["tokio", "wayland", "compositor", "backends", "render" ]
-categories = ["graphics-programming"]
+categories = ["graphics"]
 homepage = "https://github.com/mlambert125/tokio_way_backends"
 repository = "https://github.com/mlambert125/tokio_way_backends"
 
 [dependencies]
 anyhow = "1.0.100"
 tracing = { version = "0.1.41" }
-tokio = { version = "1.48", features = ["full"] }
+# channels (`sync`), spawning onto the caller's runtime (`rt`), `select!`
+# (`macros`), the headless backend's pacing timers (`time`), and `AsyncFd`
+# for the DRM backend's event loop (`net`).
+tokio = { version = "1.48", features = ["sync", "rt", "macros", "time", "net"] }
 tokio-util = "0.7.18"
+libc = "0.2.189"
+strum = { version ="0.28.0", features = ["derive"] }
+glutin = { version = "0.32", default-features = false, features = ["egl", "wayland"] }
+glutin-winit = { version = "0.5", default-features = false, features = ["egl", "wayland"] }
+winit = "0.30.13"
+raw-window-handle = "0.6"
+glow = "0.16"
+
+# The DRM/KMS + libinput backend. These link system libraries at build time
+# (libdrm, gbm, libinput, libudev, libseat, EGL); the crate therefore builds
+# only where those are present — see flake.nix for the build inputs.
+drm = "0.14"
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+input = "0.9"
+udev = "0.9"
+libseat = "0.2"
+khronos-egl = { version = "6", features = ["static"] }
+
+[dev-dependencies]
+# The tests also drive backends under `#[tokio::test]` and race them against
+# timeouts, which wants more of tokio than the library itself does.
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "time"] }
