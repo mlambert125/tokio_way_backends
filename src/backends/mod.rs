@@ -8,6 +8,10 @@ use tokio_util::sync::CancellationToken;
 use crate::messages::{BackendMessage, BackendRequest};
 use crate::scene_graph::SceneGraph;
 
+/// The DRM/KMS + libinput backend, for bare hardware. Behind the `drm`
+/// feature: it links system libraries and a static `libEGL` that a winit-only
+/// build must not pull in — see the crate's `Cargo.toml`.
+#[cfg(feature = "drm")]
 pub mod drm;
 pub mod null;
 pub mod winit;
