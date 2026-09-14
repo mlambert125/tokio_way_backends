@@ -229,17 +229,25 @@ impl App {
     }
 
     /// Draw whatever the compositor has published since the last draw.
+    /// Returns whether anything was actually drawn.
     ///
     /// Several wake-ups can arrive for one frame, or one wake-up can cover
     /// several frames, so the receiver's own change flag decides whether there
-    /// is anything to do rather than the number of events.
-    fn present_pending_frames(&mut self) {
+    /// is anything to do rather than the number of events. Called only from
+    /// `RedrawRequested`: the host saying a frame drawn now will be shown is
+    /// the only permission to draw there is. Drawing the moment a frame was
+    /// published — as this backend once did — swaps at whatever rate the
+    /// compositor publishes, which under a drag is input rate: hundreds of
+    /// swaps a second thrashing the host's buffer pool, every one of them
+    /// redrawn a second time by the redraw that followed.
+    fn present_pending_frames(&mut self) -> bool {
         if !self.frames.has_changed().unwrap_or(false) {
-            return;
+            return false;
         }
         let frame = self.frames.borrow_and_update().clone();
         let cursor_moved = self.drawn_cursor != frame.cursor.serial;
         self.drawn_cursor = frame.cursor.serial;
+        let mut drew_any = false;
         let mut presented = Vec::new();
         for scene in &frame.scenes {
             // Outputs are paced apart, so a frame is mostly scenes already on
@@ -255,6 +263,7 @@ impl App {
                 continue;
             }
             self.present_scene(scene, Self::cursor_for(&frame, scene.output_id));
+            drew_any = true;
             if scene_new {
                 presented.push(scene.output_id);
             }
@@ -293,14 +302,11 @@ impl App {
                     sequence: *sequence,
                     flags: PresentationFlags::default(),
                 });
-            // And the pacing: this output can take another frame once the host
-            // says it is time to draw again. Asking only after presenting is
-            // what bounds the compositor to one frame in flight per output.
-            self.ask_for_a_frame();
         }
+        drew_any
     }
 
-    /// Ask the host when to draw next, and pass that on as a frame request.
+    /// Ask the host for a `RedrawRequested`, the only moment anything draws.
     ///
     /// A hosted backend has no vblank of its own — it is a client of another
     /// compositor, and `RedrawRequested` is that compositor telling it when a
@@ -583,10 +589,15 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // The host is ready to show another frame. Repaint what is
-                // already here so the window is never blank, and tell the
-                // compositor it may compose the next one.
-                self.repaint();
+                // The host is ready to show another frame — the one moment
+                // anything is drawn. The newest published frame wins; with
+                // nothing newly published (the host asked on its own — an
+                // expose, a resize) the last frame is repainted so the window
+                // is never blank. Then the compositor may compose the next
+                // one, which bounds it to one frame in flight per output.
+                if !self.present_pending_frames() {
+                    self.repaint();
+                }
                 let _ = self.backend_sender.try_send(frame_request());
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -758,7 +769,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Shutdown => {
                 event_loop.exit();
             }
-            UserEvent::FrameReady => self.present_pending_frames(),
+            // Only a nudge: the frame stays in the slot until the host says
+            // a drawn frame will be shown, and several nudges coalesce into
+            // the one redraw that follows.
+            UserEvent::FrameReady => self.ask_for_a_frame(),
             UserEvent::Request(BackendRequest::ProbeDmabuf) => self.answer_dmabuf_probe(),
             UserEvent::Request(BackendRequest::ImportDmabuf { token, image }) => {
                 self.answer_dmabuf_import(token, &image);
