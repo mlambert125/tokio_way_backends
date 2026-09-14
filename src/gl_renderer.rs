@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use glow::HasContext;
+use std::os::fd::AsFd;
 use tracing::{debug, warn};
 
 use crate::{
@@ -601,6 +602,15 @@ impl GlRenderer {
                 release.replace(duplicate);
             }
         }
+        // Deliberately NOT mirrored into the kernel's implicit-sync state
+        // for producers without an explicit-sync channel: importing a fence
+        // into a dma-buf other processes wait on puts this backend's
+        // liveness promises into the whole system's dependency graph — a
+        // fence that failed to signal there stalls the producer, the host
+        // compositor, and everything else sharing the GPU. Until the
+        // explicit-sync protocol carries these per-buffer with a client
+        // that opted in, the producer's protection is `wl_buffer.release`
+        // timing alone, as it always was.
     }
 
     /// Draw a run of elements into the already-set-up pipeline.
@@ -670,9 +680,24 @@ impl GlRenderer {
                 let texture = self.upload(image)?;
                 // Explicit sync: a producer that supplied a fence has not
                 // promised its writes visible until it signals, so the wait
-                // must be queued before the draw that samples them.
+                // must be queued before the draw that samples them. A
+                // producer that supplied none still has fences — the kernel
+                // keeps them on the dma-buf — so they are exported and
+                // waited on the same way. Without that, a Vulkan client's
+                // in-flight rendering is sampled mid-write, and its window
+                // blinks blank for a frame whenever the race lands.
                 if let Some(fence) = image.acquire_fence() {
                     self.wait_acquire(fence);
+                } else if let Some(dmabuf) = image.dmabuf() {
+                    // Waited on the CPU, briefly and boundedly, never on the
+                    // GPU: a queued GPU wait can never be revoked, so a fence
+                    // that failed to signal would wedge this context's queue
+                    // — and on shared hardware, everything behind it — where
+                    // a poll that times out merely samples a frame early,
+                    // which was the status quo before implicit sync at all.
+                    if let Some(fence) = dmabuf.export_implicit_fence() {
+                        wait_sync_file_blocking(fence.as_fd());
+                    }
                 }
                 // And the reverse promise: a producer that asked to hear
                 // when the reads are done gets this frame's end fence —
@@ -1469,6 +1494,25 @@ unsafe fn upload_region(gl: &glow::Context, image: &TextureImage, rect: TextureR
 /// A physical framebuffer extent divided by the output scale, in logical
 /// pixels, never below one. Fractional: the projection uniform takes it as a
 /// float, so there is no rounding to a whole pixel here.
+/// Wait CPU-side for a sync file to signal, briefly and boundedly.
+///
+/// The cap is half a frame: a healthy producer's fence signals in well under
+/// that, and one that does not is sampled anyway — a single early-sampled
+/// frame beats a stalled compositor, and a stall here is on the thread that
+/// drives every window. Deliberately never a GPU-side wait; see the caller.
+fn wait_sync_file_blocking(fence: std::os::fd::BorrowedFd<'_>) {
+    let mut poll = libc::pollfd {
+        fd: std::os::fd::AsRawFd::as_raw_fd(&fence),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll` reads and writes only the pollfd, which lives across
+    // the call.
+    unsafe {
+        libc::poll(&raw mut poll, 1, 8);
+    }
+}
+
 fn logical_extent(physical: u32, scale: f64) -> f64 {
     (f64::from(physical) / scale).max(1.0)
 }

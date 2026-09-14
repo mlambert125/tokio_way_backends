@@ -217,6 +217,71 @@ pub struct DmabufImage {
     pub planes: Vec<DmabufPlane>,
 }
 
+impl DmabufImage {
+    /// The fence covering this buffer's pending GPU writes, exported from the
+    /// kernel's implicit-sync state, or `None` when there are none to wait
+    /// for or the kernel predates the ioctl (5.16).
+    ///
+    /// This is the bridge for producers that never speak an explicit-sync
+    /// protocol — a Vulkan client, say, whose WSI attaches its rendering
+    /// fences to the dma-buf and assumes every reader honours them. GL
+    /// sampling through an `EGLImage` does not reliably do so on its own,
+    /// and the symptom is exactly what it sounds like: the compositor
+    /// occasionally samples the buffer mid-clear and a window blinks blank
+    /// for a frame.
+    #[must_use]
+    pub fn export_implicit_fence(&self) -> Option<std::os::fd::OwnedFd> {
+        // Planes almost always share one descriptor; deduplicate so a
+        // multi-plane format costs one ioctl, not three.
+        let mut seen = Vec::new();
+        let mut fence: Option<std::os::fd::OwnedFd> = None;
+        for plane in &self.planes {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&*plane.fd);
+            if seen.contains(&raw) {
+                continue;
+            }
+            seen.push(raw);
+            // Asking as a reader: the fences handed back are the writers'.
+            if let Some(exported) = export_sync_file(raw, DMA_BUF_SYNC_READ) {
+                // The last one wins; in practice there is one descriptor.
+                fence = Some(exported);
+            }
+        }
+        fence
+    }
+}
+
+/// `DMA_BUF_SYNC_READ`: the flag naming the reader's side of the implicit
+/// sync contract in both ioctls below.
+const DMA_BUF_SYNC_READ: u32 = 1;
+
+/// `struct dma_buf_export_sync_file` / `dma_buf_import_sync_file`: one u32 of
+/// flags and one descriptor, in both directions.
+#[repr(C)]
+struct DmaBufSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`: `_IOWR('b', 2, struct dma_buf_export_sync_file)`.
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong = 0xc008_6202;
+
+/// Pull the current fences for `flags`-type access out of a dma-buf, as a
+/// sync file. `None` for "nothing to wait on" as well as for any failure —
+/// the caller cannot tell them apart and treats both as "sample and hope",
+/// which is the pre-implicit-sync status quo.
+fn export_sync_file(dmabuf_fd: i32, flags: u32) -> Option<std::os::fd::OwnedFd> {
+    let mut arg = DmaBufSyncFile { flags, fd: -1 };
+    // SAFETY: the ioctl reads and writes only `arg`, which lives across the
+    // call; a non-negative returned descriptor is owned from that moment.
+    unsafe {
+        if libc::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &raw mut arg) != 0 {
+            return None;
+        }
+        (arg.fd >= 0).then(|| std::os::fd::FromRawFd::from_raw_fd(arg.fd))
+    }
+}
+
 /// A format a backend can import, and the modifiers it accepts for it.
 #[derive(Debug, Clone)]
 pub struct DmabufFormat {
@@ -322,7 +387,10 @@ mod tests {
         let written = unsafe { libc::write(write.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
         assert_eq!(written, 1);
         assert!(fence.wait_blocking(1000));
-        assert!(fence.take().is_none(), "a successful wait consumes the fence");
+        assert!(
+            fence.take().is_none(),
+            "a successful wait consumes the fence"
+        );
     }
 
     #[test]
