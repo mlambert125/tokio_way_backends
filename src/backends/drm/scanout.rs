@@ -41,6 +41,11 @@ use crate::scene_graph::{Scene, SceneElement, SceneGraph};
 /// device. Not in khronos-egl's constants, so spelled out from the spec.
 const PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
 
+/// The one pixel format everything here agrees on: the GBM surfaces are
+/// created with it, the EGL config is chosen by it, and `add_framebuffer`'s
+/// depth/bpp of 24/32 describe it.
+const SCANOUT_FORMAT: Format = Format::Xrgb8888;
+
 /// A seat-opened DRM node, owning its fd through the libseat token.
 ///
 /// The newtype is what lets gbm and drm-rs treat the seat's device as their
@@ -180,27 +185,7 @@ impl Scanout {
         egl.bind_api(egl::OPENGL_ES_API)
             .map_err(|e| anyhow::anyhow!("could not bind the GLES API: {e}"))?;
 
-        let config = egl
-            .choose_first_config(
-                display,
-                &[
-                    egl::SURFACE_TYPE,
-                    egl::WINDOW_BIT,
-                    egl::RED_SIZE,
-                    8,
-                    egl::GREEN_SIZE,
-                    8,
-                    egl::BLUE_SIZE,
-                    8,
-                    egl::ALPHA_SIZE,
-                    0,
-                    egl::RENDERABLE_TYPE,
-                    egl::OPENGL_ES3_BIT,
-                    egl::NONE,
-                ],
-            )
-            .map_err(|e| anyhow::anyhow!("no matching EGL config: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("the driver offered no EGL config for scanout"))?;
+        let config = choose_scanout_config(&egl, display)?;
 
         let context = egl
             .create_context(
@@ -291,7 +276,7 @@ impl Scanout {
                 .create_surface::<()>(
                     u32::from(width),
                     u32::from(height),
-                    Format::Xrgb8888,
+                    SCANOUT_FORMAT,
                     BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
                 )
                 .map_err(|e| anyhow::anyhow!("could not create a GBM surface: {e}"))?;
@@ -654,6 +639,48 @@ pub fn scanout_flags() -> PresentationFlags {
 #[must_use]
 pub fn presentation_time() -> MonotonicTimeStamp {
     MonotonicTimeStamp::now()
+}
+
+/// Choose the EGL config whose native visual is [`SCANOUT_FORMAT`].
+///
+/// The attribute list alone cannot do this: EGL attributes are minimums, and
+/// the spec sorts deeper color buffers first, so asking for 8/8/8 hands back
+/// a 10-bit config on most modern drivers. On the GBM platform Mesa then
+/// refuses `eglCreateWindowSurface` with `EGL_BAD_MATCH` unless the config's
+/// `EGL_NATIVE_VISUAL_ID` — a DRM fourcc there — equals the GBM surface's
+/// format. So every matching config is fetched and filtered on that id.
+fn choose_scanout_config(
+    egl: &egl::Instance<egl::Static>,
+    display: egl::Display,
+) -> anyhow::Result<egl::Config> {
+    let attribs = [
+        egl::SURFACE_TYPE,
+        egl::WINDOW_BIT,
+        egl::RED_SIZE,
+        8,
+        egl::GREEN_SIZE,
+        8,
+        egl::BLUE_SIZE,
+        8,
+        egl::RENDERABLE_TYPE,
+        egl::OPENGL_ES3_BIT,
+        egl::NONE,
+    ];
+    let count = egl
+        .matching_config_count(display, &attribs)
+        .map_err(|e| anyhow::anyhow!("could not count EGL configs: {e}"))?;
+    let mut configs = Vec::with_capacity(count);
+    egl.choose_config(display, &attribs, &mut configs)
+        .map_err(|e| anyhow::anyhow!("no matching EGL config: {e}"))?;
+    configs
+        .into_iter()
+        .find(|&config| {
+            egl.get_config_attrib(display, config, egl::NATIVE_VISUAL_ID)
+                .is_ok_and(|id| id.cast_unsigned() == SCANOUT_FORMAT as u32)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("the driver offered no EGL config scanning out {SCANOUT_FORMAT:?}")
+        })
 }
 
 /// Prefer the mode the display marks preferred, else the first listed.
