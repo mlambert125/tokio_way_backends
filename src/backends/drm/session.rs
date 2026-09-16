@@ -114,6 +114,21 @@ impl Session {
             .map_err(|e| anyhow::anyhow!("seat refused device {}: {e}", path.display()))
     }
 
+    /// Ask the session manager to switch to another VT.
+    ///
+    /// Only asks: the switch itself arrives, if it is granted, as a disable
+    /// through the listener, the same as a switch this process never asked
+    /// for. Nothing is torn down here — the disable is where that happens.
+    ///
+    /// # Errors
+    /// If the session manager refuses — no such VT, or the seat does not do
+    /// VT switching at all.
+    pub fn switch_session(&mut self, vt: i32) -> anyhow::Result<()> {
+        self.seat
+            .switch_session(vt)
+            .map_err(|e| anyhow::anyhow!("could not switch to VT {vt}: {e}"))
+    }
+
     /// Give a device back to the seat.
     pub fn close_device(&mut self, device: Device) {
         if let Err(e) = self.seat.close_device(device) {

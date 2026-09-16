@@ -35,6 +35,7 @@
 pub mod libinput_source;
 pub mod scanout;
 pub mod session;
+pub mod vt_switch;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -54,6 +55,7 @@ use crate::scene_graph::{SceneElement, SceneGraph};
 use libinput_source::Input;
 use scanout::{Presented, Scanout};
 use session::Session;
+use vt_switch::{KeyAction, VtKeys};
 
 /// How to start the DRM backend.
 #[derive(Debug, Clone, Default)]
@@ -172,6 +174,9 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
     let mut drawn_cursor = 0u64;
     let mut last_frame: Option<SceneGraph> = None;
 
+    // The held keys, watched for Ctrl+Alt+Fn — see [`vt_switch`].
+    let mut vt_keys = VtKeys::default();
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
@@ -216,6 +221,15 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                         let _ = messages.send(frame_request(id, scanout.refresh_ns(id))).await;
                     }
                 }
+                // Going away: every key still down will be released on some
+                // other VT where this process cannot see it, so the
+                // compositor is told now — otherwise it comes back with
+                // Ctrl and Alt stuck pressed. See [`VtKeys::release_all`].
+                if was_active && !now_active {
+                    for message in vt_keys.release_all() {
+                        let _ = messages.send(message).await;
+                    }
+                }
                 guard.clear_ready();
             }
 
@@ -232,7 +246,18 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                 match input.dispatch(size) {
                     Ok(events) if active => {
                         for message in events {
-                            let _ = messages.send(message).await;
+                            match vt_keys.on_key(&message) {
+                                KeyAction::Forward => {
+                                    let _ = messages.send(message).await;
+                                }
+                                KeyAction::Swallow => {}
+                                KeyAction::SwitchVt(vt) => {
+                                    info!("Ctrl+Alt chord: asking for VT {vt}");
+                                    if let Err(e) = session.borrow_mut().switch_session(vt) {
+                                        warn!("{e}");
+                                    }
+                                }
+                            }
                         }
                     }
                     Ok(_) => {}
