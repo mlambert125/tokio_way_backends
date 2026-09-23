@@ -41,22 +41,13 @@ use crate::scene_graph::{Scene, SceneElement, SceneGraph};
 const WINIT_OUTPUT_ID: OutputId = OutputId(1);
 
 /// The refresh this backend advertises for its output, in milli-hertz (60 Hz).
-/// A hosted window has no vblank of its own, so this is the nominal rate used
-/// both in the output mode and to estimate frame timing.
 const WINIT_REFRESH_MHZ: i32 = 60_000;
 
-/// That refresh as a period in nanoseconds, for the frame-timing estimates a
-/// hosted backend can only guess at. `1e12 / mHz`, which for any real refresh
-/// is well inside `u32`.
+/// That refresh as a period in nanoseconds
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 const WINIT_REFRESH_NS: u32 = (1_000_000_000_000_i64 / WINIT_REFRESH_MHZ as i64) as u32;
 
-/// A frame request for the host output.
-///
-/// The predicted present is one refresh out from now: `RedrawRequested` says a
-/// frame drawn now will be shown, and the host shows it on its next refresh. It
-/// is an estimate — a hosted window cannot see the host's vblank — but a
-/// truthful one to compose an animation against.
+/// A frame request for the host output
 fn frame_request() -> BackendMessage {
     let now = MonotonicTimeStamp::now();
     let predicted_present = MonotonicTimeStamp {
@@ -70,16 +61,7 @@ fn frame_request() -> BackendMessage {
     }
 }
 
-/// Describe the host window as the one output this backend has, reading its
-/// current size and scale.
-///
-/// Called wherever the description is (re)sent — startup, a resize, a scale
-/// change — so every report is built the same way from the same source.
-///
-/// The scale is the host's, rounded to 120ths. `inner_size` is already
-/// physical pixels, so the scale does not change how big the framebuffer is —
-/// it changes how much of it one logical pixel covers, and so how large a
-/// window the compositor lays out.
+/// Describe the host window as the one output this backend has, reading its current size and scale.
 fn describe_output(window: &Window) -> Output {
     let size = window.inner_size();
     Output {
@@ -106,30 +88,19 @@ fn describe_output(window: &Window) -> Output {
     }
 }
 
-/// Events coming from outside of the window that should be handled by the
-/// winit event loop
+/// Events coming from outside of the window that should be handled by the winit event loop
 enum UserEvent {
     /// A shutdown event happening from outside that should exit the event loop
     Shutdown,
-    /// A new frame is in the slot. Carries nothing: the payload is read from
-    /// the watch receiver at the point of drawing, so wake-ups that pile up
-    /// behind a slow frame collapse into one draw of the newest frame instead
-    /// of a backlog of stale ones.
+    /// A new frame is in the slot
     FrameReady,
-    /// The compositor has asked the backend for something. Carried into the
-    /// event loop rather than handled where it arrives, because answering it
-    /// needs the GL context and that only exists on this thread.
+    /// A backend request from the compositor came in
     Request(BackendRequest),
 }
 
-/// The window and everything bound to its GL context.
-///
-/// Created together in `resumed` because none of it is useful without the
-/// rest, and dropped together so the context outlives the renderer's textures.
+/// The window and everything bound to its GL context
 struct GlState {
-    /// What this driver can do with dma-bufs, worked out once when the context
-    /// was made. Stored rather than re-derived because probing costs a texture
-    /// round trip and the answer cannot change while the context lives.
+    /// What this can do with dma-buf
     dmabuf_support: DmabufCapabilities,
     /// The winit window
     window: Arc<Window>,
@@ -143,58 +114,34 @@ struct GlState {
 
 /// Winit application
 struct App {
-    /// Signals that the backend is up, which is what releases the rest of
-    /// startup. Sent once the window and GL context exist and the backend has
-    /// reported what it can do — not merely once the thread is running.
-    ///
-    /// Everything a client learns at connection time is decided by then: a
-    /// socket advertised earlier would let a client enumerate the globals
-    /// before dma-buf support is known, and it would pick shm for the rest of
-    /// its life on the strength of that.
+    /// One-shot that signals that the backend is up
     ready: Option<tokio::sync::oneshot::Sender<()>>,
     /// GL State data
     gl: Option<GlState>,
+    /// The channel to send messages to the compositor
     backend_sender: Sender<BackendMessage>,
-    /// Cancellation token for this host to cancel the compositor at large
-    /// when a window is closed, or an unrecoverable error occurs
+    /// Cancellation token for this host to cancel the compositor at large when a window is closed
     cancel_token: CancellationToken,
-    /// The newest frame the compositor has published.
+    /// The newest frame the compositor has published
     frames: watch::Receiver<SceneGraph>,
     /// Last drawn frame, for repainting on resize
     last_frame: Option<SceneGraph>,
-    /// The serial of the newest scene actually drawn on each output.
-    ///
-    /// A published frame carries the newest scene for every output, most of
-    /// which have already been drawn — the compositor recomposes an output
-    /// only when that output has asked. This is what separates the one scene
-    /// that is new from the ones that are being carried along.
+    /// The serial of the newest scene actually drawn on each output
     drawn: HashMap<OutputId, u64>,
-    /// The cursor serial last drawn, so a cursor-only frame update triggers a
-    /// redraw of the cursor's output without being mistaken for new content.
+    /// The cursor serial last drawn
     drawn_cursor: u64,
-    /// A dma-buf probe that arrived before there was a GL context to answer it
-    /// with. Answered from `resumed` instead of being refused: the compositor
-    /// asks as it starts up, and a hosted backend has no context until its
-    /// window exists.
+    /// Whether a dma-buf probe arrived before there was a context to answer it with
     dmabuf_probe_pending: bool,
-    /// How many frames this backend has presented on each output, reported as
-    /// the presentation sequence. A hosted window has no true refresh counter.
+    /// How many frames this backend has presented on each output
     presented: HashMap<OutputId, u64>,
-    /// Whether a touch has ever arrived. winit reports no touch devices, only
-    /// touch events, so this is the only evidence a touchscreen exists.
+    /// Whether a touch has ever arrived
     touch_seen: bool,
-    /// The title the host window is created with — the compositor's name,
-    /// which is the compositor's to say, not this library's.
+    /// The title the host window is created with
     window_title: String,
 }
 
 impl App {
     /// Draw a scene and put it on screen.
-    ///
-    /// The drawable size is read back from the window rather than taken from
-    /// the scene: a resize reaches winit before the compositor has produced a
-    /// scene at the new size, and drawing the old scene into the new viewport
-    /// is better than skipping the frame.
     fn present_scene(&mut self, scene: &Scene, cursor: &[SceneElement]) {
         if scene.output_id != WINIT_OUTPUT_ID {
             return;
@@ -217,9 +164,7 @@ impl App {
         }
     }
 
-    /// The cursor elements to draw over `output`, or nothing if the pointer is
-    /// elsewhere. The cursor lives beside the scenes in the frame; this backend
-    /// has no cursor plane, so it composites it on top.
+    /// The cursor elements to draw over `output`
     fn cursor_for(scene_graph: &SceneGraph, output: OutputId) -> &[SceneElement] {
         if scene_graph.cursor.output == Some(output) {
             &scene_graph.cursor.elements
@@ -228,11 +173,7 @@ impl App {
         }
     }
 
-    /// Draw whatever the compositor has published since the last draw.
-    ///
-    /// Several wake-ups can arrive for one frame, or one wake-up can cover
-    /// several frames, so the receiver's own change flag decides whether there
-    /// is anything to do rather than the number of events.
+    /// Draw whatever the compositor has published since the last draw
     fn present_pending_frames(&mut self) {
         if !self.frames.has_changed().unwrap_or(false) {
             return;
@@ -242,12 +183,6 @@ impl App {
         self.drawn_cursor = frame.cursor.serial;
         let mut presented = Vec::new();
         for scene in &frame.scenes {
-            // Outputs are paced apart, so a frame is mostly scenes already on
-            // screen. A scene whose serial is unchanged normally needs no
-            // redraw — except when the cursor over this output moved, since the
-            // cursor is composited on top and a stale one would linger. That
-            // cursor-only redraw does not count as a presentation: the content
-            // did not change, so its clients' frame callbacks must not fire.
             let scene_new = self.drawn.get(&scene.output_id) != Some(&scene.serial);
             let cursor_here = frame.cursor.output == Some(scene.output_id);
             let needs_redraw = scene_new || (cursor_moved && cursor_here);
@@ -261,8 +196,6 @@ impl App {
         }
         if let Some(gl) = self.gl.as_mut() {
             gl.renderer.prune_caches(&frame);
-            // A snippet that failed to compile drew plain; the compositor
-            // hears about it once, here, on the frame that first tried it.
             for (effect, log) in gl.renderer.take_effect_failures() {
                 let _ = self
                     .backend_sender
@@ -272,18 +205,8 @@ impl App {
         self.last_frame = Some(frame);
 
         for output_id in presented {
-            // A per-output refresh counter. A hosted window has no true msc, so
-            // this counts frames presented rather than reading one off the
-            // hardware — honest as "how many this backend has shown", and better
-            // than a constant zero for a client watching it advance.
             let sequence = self.presented.entry(output_id).or_default();
             *sequence += 1;
-            // Reported even if there was no context to draw with or the window
-            // had no area. The scene is dealt with either way, and a backend
-            // that went quiet here would strand every client waiting on a
-            // frame callback. The flags stay default: a hosted frame goes
-            // through a host compositor, so none of vsync/hw_clock/… can be
-            // vouched for — see `PresentationFlags`.
             let _ = self
                 .backend_sender
                 .try_send(BackendMessage::FramePresented {
@@ -293,26 +216,18 @@ impl App {
                     sequence: *sequence,
                     flags: PresentationFlags::default(),
                 });
-            // And the pacing: this output can take another frame once the host
-            // says it is time to draw again. Asking only after presenting is
-            // what bounds the compositor to one frame in flight per output.
             self.ask_for_a_frame();
         }
     }
 
-    /// Ask the host when to draw next, and pass that on as a frame request.
-    ///
-    /// A hosted backend has no vblank of its own — it is a client of another
-    /// compositor, and `RedrawRequested` is that compositor telling it when a
-    /// frame it draws will be shown. That is the same signal a page flip
-    /// completing will be on a DRM backend, arriving by a different route.
+    /// Ask the host when to draw next, and pass that on as a frame request
     fn ask_for_a_frame(&mut self) {
         if let Some(gl) = self.gl.as_ref() {
             gl.window.request_redraw();
         }
     }
 
-    /// Redraw the last frame, for when the window changed but the scene did not.
+    /// Redraw the last frame, for when the window changed but the scene did not
     fn repaint(&mut self) {
         let Some(frame) = self.last_frame.clone() else {
             return;
@@ -322,7 +237,7 @@ impl App {
         }
     }
 
-    /// Create the window, EGL context, and renderer.
+    /// Create the window, EGL context and renderer
     fn init_gl(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<GlState> {
         let window_attributes = WindowAttributes::default().with_title(self.window_title.clone());
         let (window, config) = DisplayBuilder::new()
@@ -338,34 +253,20 @@ impl App {
         );
 
         let display = config.display();
-        // GLES rather than desktop GL: it is what the shaders target, and what
-        // is universally available on the Mesa drivers a compositor runs on.
         let context_attributes = ContextAttributesBuilder::new()
             .with_context_api(ContextApi::Gles(Some(Version::new(3, 0))))
             .build(Some(window.window_handle()?.as_raw()));
-        // SAFETY: the window outlives the context — both live in `GlState`,
-        // and `window` is declared first so it is dropped last.
         let not_current = unsafe { display.create_context(&config, &context_attributes)? };
 
         let surface_attributes = window.build_surface_attributes(<_>::default())?;
-        // SAFETY: the attributes carry this window's handle, and the window
-        // outlives the surface for the same reason as the context.
         let surface = unsafe { display.create_window_surface(&config, &surface_attributes)? };
         let context = not_current.make_current(&surface)?;
-        // Only one variant exists: glutin is built here with the EGL backend
-        // alone, which is also the only one a dma-buf can be imported through.
         let RawDisplay::Egl(raw_display) = display.raw_display();
 
-        // Pacing comes from the host, through `RedrawRequested`, and a frame is
-        // only composed once this backend has asked for one. Blocking the swap
-        // on vblank as well would pace nothing extra and would stall the
-        // thread that handles input while it waited.
         if let Err(e) = surface.set_swap_interval(&context, SwapInterval::DontWait) {
             warn!("failed to disable vsync: {e}");
         }
 
-        // SAFETY: the display is the one the context above was made on, and it
-        // stays current on this thread for as long as the importer is used.
         let importer =
             unsafe { DmabufImporter::new(raw_display, &|symbol| display.get_proc_address(symbol)) };
         let importer = match importer {
@@ -376,14 +277,9 @@ impl App {
             }
         };
 
-        // SAFETY: the context was just made current on this thread and stays
-        // current for as long as the renderer lives.
         let renderer =
             unsafe { GlRenderer::new(|symbol| display.get_proc_address(symbol), importer)? };
 
-        // Ask the driver what it takes, and check that it means it. Done here,
-        // once, because it needs the context and nothing about the answer can
-        // change while that context lives.
         let dmabuf_support = renderer.dmabuf_support();
         report_dmabuf_support(&dmabuf_support);
 
@@ -396,10 +292,7 @@ impl App {
         })
     }
 
-    /// Try importing one client buffer and report back.
-    ///
-    /// Answered even when there is no context to try with: a client's `create`
-    /// is waiting on this, and silence would hang it.
+    /// Try importing one client buffer and report back
     fn answer_dmabuf_import(&mut self, token: u64, image: &DmabufImage) {
         let imported = self
             .gl
@@ -410,10 +303,7 @@ impl App {
             .blocking_send(BackendMessage::DmabufImportResult { token, imported });
     }
 
-    /// Answer a capture request with the pixels the output is showing.
-    ///
-    /// Answered even when there is nothing to give: whoever asked — a
-    /// screenshot tool, a portal — is waiting on the token.
+    /// Answer a capture request with the pixels the output is showing
     fn answer_capture(&mut self, token: u64, output: OutputId, overlay_cursor: bool) {
         let capture = self.capture_output(output, overlay_cursor);
         let _ = self
@@ -421,16 +311,11 @@ impl App {
             .blocking_send(BackendMessage::CaptureResult { token, capture });
     }
 
-    /// Re-render the output's newest scene offscreen and read it back, or
-    /// `None` when there is no such output, no context, or nothing composed
-    /// for it yet.
+    /// Re-render the output's newest scene offscreen and read it back
     fn capture_output(&mut self, output: OutputId, overlay_cursor: bool) -> Option<CapturedFrame> {
         if output != WINIT_OUTPUT_ID {
             return None;
         }
-        // Cloned so the borrow of the frame and the mutable borrow of the
-        // renderer cannot collide; the clone is arcs and cursor quads, not
-        // pixels.
         let frame = self.last_frame.clone()?;
         let scene = frame.scenes.iter().find(|s| s.output_id == output)?;
         let cursor = if overlay_cursor {
@@ -469,9 +354,7 @@ impl App {
 }
 
 impl ApplicationHandler<UserEvent> for App {
-    /// Called once when the app starts and is ready.  This is a bit poorly
-    /// named for platforms that don't do tombstoning (desktops), but that's
-    /// what `winit::application::ApplicationHandler` calls it
+    /// Called once when the app starts and is ready. Named this way for platforms that can tombstone
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.gl.is_some() {
             return;
@@ -480,11 +363,7 @@ impl ApplicationHandler<UserEvent> for App {
         let gl = match self.init_gl(event_loop) {
             Ok(gl) => gl,
             Err(e) => {
-                // Without a context there is nothing to display, and no
-                // software path to fall back to, so stop rather than run blind.
                 error!("failed to initialise GL backend: {e:#}");
-                // Release startup even so: it is waiting on this, and a
-                // compositor that is shutting down should not also hang.
                 if let Some(ready) = self.ready.take() {
                     let _ = ready.send(());
                 }
@@ -495,17 +374,12 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
 
-        // Report hardware capabilities
         let pending_probe = self.dmabuf_probe_pending;
         let _ = self
             .backend_sender
             .blocking_send(BackendMessage::SeatCapabilities {
                 pointer: true,
                 keyboard: true,
-                // A host window is told about touch only when a touch happens,
-                // so there is nothing to report up front. The capability is
-                // announced from the first touch event instead — see the
-                // `WindowEvent::Touch` arm.
                 touch: false,
             });
         let _ = self
@@ -517,20 +391,14 @@ impl ApplicationHandler<UserEvent> for App {
         gl.window.set_cursor_visible(false);
         self.gl = Some(gl);
 
-        // A probe that arrived before there was a context to answer it with.
         if pending_probe {
             self.answer_dmabuf_probe();
         }
 
-        // Everything a connecting client will be told now exists.
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(());
         }
 
-        // Clear the window so it is not showing whatever was in the buffer
-        // before the first scene arrives. Black rather than any policy colour:
-        // the background is the compositor's to choose, and it has not yet
-        // composed anything to choose it in.
         let empty = Scene {
             scale: Scale::ONE,
             output_id: WINIT_OUTPUT_ID,
@@ -541,15 +409,10 @@ impl ApplicationHandler<UserEvent> for App {
             damage: Vec::new(),
         };
         self.present_scene(&empty, &[]);
-        // Nothing has been composed for this output yet, and nothing will be
-        // until it is asked for. This is the first turn of that loop.
         let _ = self.backend_sender.try_send(frame_request());
     }
 
-    /// Window event handler (called by winit event loop)
-    ///
-    /// One arm per winit event, and each is short; the length is the number of
-    /// events rather than the complexity of any of them.
+    /// Window event handler
     #[allow(clippy::too_many_lines)]
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
@@ -569,11 +432,6 @@ impl ApplicationHandler<UserEvent> for App {
                 self.repaint();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
-                // The window moved to a monitor with a different scale, or the
-                // host's scale changed under it. Re-described in full — size
-                // and scale are read together off the window — so the
-                // compositor re-lays-out to the new logical size just as it
-                // would for a resize.
                 if let Some(gl) = self.gl.as_ref() {
                     let _ = self
                         .backend_sender
@@ -583,19 +441,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // The host is ready to show another frame. Repaint what is
-                // already here so the window is never blank, and tell the
-                // compositor it may compose the next one.
                 self.repaint();
                 let _ = self.backend_sender.try_send(frame_request());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let Some(scancode) = event.physical_key.to_scancode() {
-                    // The evdev code plus eight, which is the xkb keycode the
-                    // compositor feeds its own keymap. Modifiers are worked out
-                    // there, not here — this backend has no keymap to serialise
-                    // against, and computing one against the host's layout would
-                    // only disagree with the one clients are given.
                     let keycode = scancode + 8;
                     let key_state = if event.state.is_pressed() {
                         KeyState::Pressed
@@ -625,9 +475,6 @@ impl ApplicationHandler<UserEvent> for App {
                     winit::event::MouseButton::Middle => MouseButton::MIDDLE,
                     winit::event::MouseButton::Back => MouseButton::BACK,
                     winit::event::MouseButton::Forward => MouseButton::FORWARD,
-                    // winit's `Other` codes are platform-defined numbers, not
-                    // evdev codes, so forwarding one as if it were would name
-                    // a button the user did not press.
                     winit::event::MouseButton::Other(_) => return,
                 };
                 let st = if state.is_pressed() {
@@ -644,10 +491,6 @@ impl ApplicationHandler<UserEvent> for App {
                     });
             }
             WindowEvent::Touch(touch) => {
-                // winit has no "a touchscreen exists" signal, so the first
-                // touch is the signal: the seat gains the capability then, and
-                // clients that care re-read it. Announcing it up front would
-                // claim a device that may not exist.
                 if !self.touch_seen {
                     self.touch_seen = true;
                     let _ = self
@@ -659,10 +502,6 @@ impl ApplicationHandler<UserEvent> for App {
                         });
                 }
 
-                // The id is a `u64` from winit and an `i32` on the wire. Real
-                // devices number their fingers from zero, so the truncation is
-                // theoretical, but wrapping it deliberately keeps two fingers
-                // from ever colliding on one id.
                 let id = i32::try_from(touch.id % u64::from(i32::MAX.cast_unsigned())).unwrap_or(0);
                 let (x, y) = (touch.location.x, touch.location.y);
                 let time = MonotonicTimeStamp::now();
@@ -679,8 +518,6 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = self.backend_sender.blocking_send(message);
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
-                // A touchpad reports its scroll ending, and that end is
-                // information a client cannot infer from the deltas.
                 if phase == winit::event::TouchPhase::Ended {
                     let _ = self
                         .backend_sender
@@ -690,11 +527,6 @@ impl ApplicationHandler<UserEvent> for App {
                     return;
                 }
 
-                // The two delta kinds are the two sources: lines come from a
-                // wheel, which clicks, and pixels from a touchpad, which does
-                // not. winit does not say which device it was, but it does say
-                // which unit — and the unit only exists because the devices
-                // differ.
                 let (dx, dy, source, v120_x, v120_y) = match delta {
                     #[allow(clippy::cast_possible_truncation)]
                     winit::event::MouseScrollDelta::LineDelta(x, y) => (
@@ -731,14 +563,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    /// Device event handler (called by winit event loop): raw input that is
-    /// not tied to the window.
-    ///
-    /// Relative pointer motion comes in here — unaccelerated deltas from the
-    /// host's relative-pointer protocol — and flows alongside the absolute
-    /// positions from `CursorMoved`. Both are sent all the time: a client
-    /// consuming `zwp_relative_pointer_v1` wants the deltas whether or not
-    /// the pointer is locked, and the compositor picks which to route.
+    /// Device event handler
     fn device_event(&mut self, _event_loop: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             let _ = self
@@ -751,8 +576,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    /// User event handler (called by winit event loop)
-    /// Winit separates this handler from the normal `windows_event` handler above
+    /// User event handler
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Shutdown => {
@@ -771,8 +595,6 @@ impl ApplicationHandler<UserEvent> for App {
                 self.answer_capture(token, output, overlay_cursor);
             }
             UserEvent::Request(BackendRequest::SetPointerConfinement { mode }) => {
-                // Ask the host; on hardware this would be ours to enforce,
-                // but here the pointer belongs to the host compositor.
                 if let Some(gl) = self.gl.as_ref() {
                     let grab = match mode {
                         PointerConfinement::None => CursorGrabMode::None,
@@ -789,9 +611,6 @@ impl ApplicationHandler<UserEvent> for App {
                 width,
                 height,
             }) => {
-                // Ask the host; whether it obliges is its call, and if it does
-                // the `Resized` event reports the change as `OutputChanged` —
-                // the same route an unasked-for resize takes.
                 if output == WINIT_OUTPUT_ID
                     && let Some(gl) = self.gl.as_ref()
                 {
@@ -804,10 +623,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
-/// Log what the driver said about dma-buf, at the level the answer deserves.
-///
-/// A failed probe is a warning rather than a debug line: the extensions are
-/// there, so a client will be told dma-buf works, and it will not.
+/// Log what the driver said about dma-buf
 fn report_dmabuf_support(support: &DmabufCapabilities) {
     let device = support.device.as_ref().map_or_else(
         || String::from("an unnamed device"),
@@ -838,8 +654,7 @@ fn report_dmabuf_support(support: &DmabufCapabilities) {
     }
 }
 
-/// Prefer the config with the fewest samples: this compositor draws axis-aligned
-/// quads, so multisampling would cost bandwidth and change nothing.
+/// Prefer the config with the fewest samples
 fn pick_glutin_config(
     configs: Box<dyn Iterator<Item = glutin::config::Config> + '_>,
 ) -> glutin::config::Config {
@@ -856,12 +671,6 @@ fn pick_glutin_config(
 
 /// Runs this wayland backend, waiting for frames from the compositor and
 /// sending over input events from keyboard/mouse, etc.
-///
-/// Blocks on the window event loop until shutdown, so it must own its thread;
-/// it also spawns onto the current tokio runtime, so that thread must have a
-/// runtime handle entered. `window_title` names the host window — the
-/// compositor's own name, since a hosted backend is a window on someone's
-/// desktop and the title is how the user tells whose.
 ///
 /// # Errors
 /// Returns an error if there any problems initializing winit
@@ -887,8 +696,6 @@ pub fn run_winit_backend(window_title: &str, channels: BackendChannels) -> anyho
         let _ = shutdown_proxy.send_event(UserEvent::Shutdown);
     });
 
-    // Only nudges the event loop; the frame itself stays in the slot until the
-    // winit thread is ready to draw it.
     let frame_proxy = proxy.clone();
     let mut notify_rx = frame_rx.clone();
     rt.spawn(async move {
@@ -899,9 +706,6 @@ pub fn run_winit_backend(window_title: &str, channels: BackendChannels) -> anyho
         }
     });
 
-    // Requests are handled on the winit thread because answering them needs
-    // the GL context, so they come in as user events rather than being read
-    // where they arrive.
     let request_proxy = proxy.clone();
     rt.spawn(async move {
         while let Some(request) = requests.recv().await {
