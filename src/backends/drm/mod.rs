@@ -35,6 +35,7 @@
 pub mod libinput_source;
 pub mod scanout;
 pub mod session;
+pub mod vt_switch;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -54,6 +55,7 @@ use crate::scene_graph::{SceneElement, SceneGraph};
 use libinput_source::Input;
 use scanout::{Presented, Scanout};
 use session::Session;
+use vt_switch::{KeyAction, VtKeys};
 
 /// How to start the DRM backend.
 #[derive(Debug, Clone, Default)]
@@ -172,6 +174,9 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
     let mut drawn_cursor = 0u64;
     let mut last_frame: Option<SceneGraph> = None;
 
+    // The held keys, watched for Ctrl+Alt+Fn — see [`vt_switch`].
+    let mut vt_keys = VtKeys::default();
+
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
@@ -210,12 +215,55 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                 let now_active = session.borrow().is_active();
                 if now_active && !was_active {
                     info!("session re-enabled; re-modesetting");
+                    // The evdev fds died with the disable; this reopens the
+                    // devices through the seat — see [`Input::resume`].
+                    if let Err(e) = input.resume() {
+                        warn!("{e}");
+                    }
                     scanout.mark_needs_modeset();
                     drawn.clear();
+                    // Put the last frame straight back on screen. Waiting for
+                    // the compositor instead means waiting for it to have a
+                    // reason to publish — and if nothing changed while the
+                    // session was away, it has none, and the user is looking
+                    // at a black screen until something does.
+                    if let Some(frame) = &last_frame {
+                        for scene in &frame.scenes {
+                            let id = scene.output_id;
+                            drawn.insert(id, scene.serial);
+                            if let Presented::Immediately { output, refresh_ns, sequence } =
+                                scanout.render_output(id, scene, cursor_for(frame, id))
+                            {
+                                let _ = messages.send(BackendMessage::FramePresented {
+                                    output,
+                                    time: scanout::presentation_time(),
+                                    refresh_ns,
+                                    sequence,
+                                    flags: scanout::scanout_flags(),
+                                }).await;
+                            }
+                        }
+                    }
                     for id in scanout.output_ids() {
                         let _ = messages.send(frame_request(id, scanout.refresh_ns(id))).await;
                     }
                 }
+                if was_active && !now_active {
+                    // Going away: every key still down will be released on
+                    // some other VT where this process cannot see it, so the
+                    // compositor is told now — otherwise it comes back with
+                    // Ctrl and Alt stuck pressed. See [`VtKeys::release_all`].
+                    for message in vt_keys.release_all() {
+                        let _ = messages.send(message).await;
+                    }
+                    // Input's revoked fds closed before the acknowledgment
+                    // below, so the manager hears "done" once it is true.
+                    input.suspend();
+                }
+                // Unconditional, and last: a no-op unless a disable is
+                // waiting, and anything the loop had to quiesce first has
+                // been by now.
+                session.borrow_mut().acknowledge_disable();
                 guard.clear_ready();
             }
 
@@ -232,7 +280,18 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                 match input.dispatch(size) {
                     Ok(events) if active => {
                         for message in events {
-                            let _ = messages.send(message).await;
+                            match vt_keys.on_key(&message) {
+                                KeyAction::Forward => {
+                                    let _ = messages.send(message).await;
+                                }
+                                KeyAction::Swallow => {}
+                                KeyAction::SwitchVt(vt) => {
+                                    info!("Ctrl+Alt chord: asking for VT {vt}");
+                                    if let Err(e) = session.borrow_mut().switch_session(vt) {
+                                        warn!("{e}");
+                                    }
+                                }
+                            }
                         }
                     }
                     Ok(_) => {}

@@ -34,6 +34,9 @@ pub struct Session {
     /// loop to decide whether it may draw and read input. Shared through an
     /// `Rc<Cell>` because the listener and the loop are the same thread.
     active: Rc<Cell<bool>>,
+    /// Whether a disable has arrived and not yet been acknowledged — see
+    /// [`Self::acknowledge_disable`].
+    disable_pending: Rc<Cell<bool>>,
 }
 
 impl Session {
@@ -48,7 +51,9 @@ impl Session {
     /// neither seatd nor logind is reachable.
     pub fn open() -> anyhow::Result<Self> {
         let active = Rc::new(Cell::new(false));
+        let disable_pending = Rc::new(Cell::new(false));
         let listener_active = Rc::clone(&active);
+        let listener_pending = Rc::clone(&disable_pending);
         let seat = Seat::open(move |_seat, event| match event {
             SeatEvent::Enable => {
                 info!("session enabled");
@@ -57,10 +62,17 @@ impl Session {
             SeatEvent::Disable => {
                 info!("session disabled (VT switch)");
                 listener_active.set(false);
+                // Not acknowledged from in here: the loop must stop touching
+                // the devices first — see [`Self::acknowledge_disable`].
+                listener_pending.set(true);
             }
         })
         .map_err(|e| anyhow::anyhow!("could not open a seat: {e}"))?;
-        Ok(Self { seat, active })
+        Ok(Self {
+            seat,
+            active,
+            disable_pending,
+        })
     }
 
     /// The fd to wait on for seat events. Readable when libseat has an
@@ -112,6 +124,38 @@ impl Session {
         self.seat
             .open_device(&path)
             .map_err(|e| anyhow::anyhow!("seat refused device {}: {e}", path.display()))
+    }
+
+    /// Answer the disable that arrived in the last dispatch, if one did.
+    ///
+    /// A disable is a request, not a statement: the session manager holds
+    /// the switch open until the client acknowledges it, and forces it
+    /// through after a timeout if the acknowledgment never comes — a forced
+    /// switch whose handover back is not clean. The loop calls this after
+    /// it has quiesced everything using the seat's devices, rather than the
+    /// listener acknowledging on the spot, so the manager only ever hears
+    /// "done" once it is true. The same order wlroots uses.
+    pub fn acknowledge_disable(&mut self) {
+        if self.disable_pending.replace(false)
+            && let Err(e) = self.seat.disable()
+        {
+            warn!("acknowledging the seat disable failed: {e}");
+        }
+    }
+
+    /// Ask the session manager to switch to another VT.
+    ///
+    /// Only asks: the switch itself arrives, if it is granted, as a disable
+    /// through the listener, the same as a switch this process never asked
+    /// for. Nothing is torn down here — the disable is where that happens.
+    ///
+    /// # Errors
+    /// If the session manager refuses — no such VT, or the seat does not do
+    /// VT switching at all.
+    pub fn switch_session(&mut self, vt: i32) -> anyhow::Result<()> {
+        self.seat
+            .switch_session(vt)
+            .map_err(|e| anyhow::anyhow!("could not switch to VT {vt}: {e}"))
     }
 
     /// Give a device back to the seat.

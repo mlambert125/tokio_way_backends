@@ -174,13 +174,14 @@ impl App {
     }
 
     /// Draw whatever the compositor has published since the last draw
-    fn present_pending_frames(&mut self) {
+    fn present_pending_frames(&mut self) -> bool {
         if !self.frames.has_changed().unwrap_or(false) {
-            return;
+            return false;
         }
         let frame = self.frames.borrow_and_update().clone();
         let cursor_moved = self.drawn_cursor != frame.cursor.serial;
         self.drawn_cursor = frame.cursor.serial;
+        let mut drew_any = false;
         let mut presented = Vec::new();
         for scene in &frame.scenes {
             let scene_new = self.drawn.get(&scene.output_id) != Some(&scene.serial);
@@ -190,6 +191,7 @@ impl App {
                 continue;
             }
             self.present_scene(scene, Self::cursor_for(&frame, scene.output_id));
+            drew_any = true;
             if scene_new {
                 presented.push(scene.output_id);
             }
@@ -216,8 +218,8 @@ impl App {
                     sequence: *sequence,
                     flags: PresentationFlags::default(),
                 });
-            self.ask_for_a_frame();
         }
+        drew_any
     }
 
     /// Ask the host when to draw next, and pass that on as a frame request
@@ -441,7 +443,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.repaint();
+                if !self.present_pending_frames() {
+                    self.repaint();
+                }
                 let _ = self.backend_sender.try_send(frame_request());
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -582,7 +586,10 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Shutdown => {
                 event_loop.exit();
             }
-            UserEvent::FrameReady => self.present_pending_frames(),
+            // Only a nudge: the frame stays in the slot until the host says
+            // a drawn frame will be shown, and several nudges coalesce into
+            // the one redraw that follows.
+            UserEvent::FrameReady => self.ask_for_a_frame(),
             UserEvent::Request(BackendRequest::ProbeDmabuf) => self.answer_dmabuf_probe(),
             UserEvent::Request(BackendRequest::ImportDmabuf { token, image }) => {
                 self.answer_dmabuf_import(token, &image);

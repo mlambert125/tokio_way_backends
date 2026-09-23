@@ -91,9 +91,36 @@ impl Input {
 
     /// The fd to wait on. Readable when libinput has events for
     /// [`Self::dispatch`].
+    ///
+    /// Stable across [`Self::suspend`]/[`Self::resume`] — it is libinput's
+    /// own epoll fd, not any device's — so registering it once is enough.
     #[must_use]
     pub fn poll_fd(&self) -> RawFd {
         self.libinput.as_raw_fd()
+    }
+
+    /// Close every device, keeping the context to be resumed.
+    ///
+    /// For a VT switch: the moment the session is disabled the kernel
+    /// revokes every evdev fd, and a revoked fd is dead for good — it does
+    /// not come back with the enable the way the DRM fd does. Suspending
+    /// closes them while they are worthless, and [`Self::resume`] reopens
+    /// the devices through the seat afresh.
+    pub fn suspend(&mut self) {
+        self.libinput.suspend();
+    }
+
+    /// Reopen the devices after [`Self::suspend`], on the session's
+    /// re-enable.
+    ///
+    /// # Errors
+    /// If libinput cannot restart its udev monitoring; the devices it
+    /// could not reopen individually are simply absent, as they would be
+    /// after an unplug.
+    pub fn resume(&mut self) -> anyhow::Result<()> {
+        self.libinput
+            .resume()
+            .map_err(|()| anyhow::anyhow!("libinput could not resume after the VT switch"))
     }
 
     /// Read whatever libinput has ready and translate it.
