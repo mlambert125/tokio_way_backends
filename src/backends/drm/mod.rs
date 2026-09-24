@@ -66,6 +66,9 @@ pub struct DrmConfig {
     /// The seat name, as libseat and udev know it. `None` uses `seat0`, the
     /// seat a single-seat machine always has.
     pub seat: Option<String>,
+    /// Whether a tap on a touchpad is a click. `None` leaves each device on
+    /// libinput's own default, which is usually off.
+    pub tap_to_click: Option<bool>,
 }
 
 /// A borrowed fd registered with tokio only to be watched, never closed.
@@ -157,7 +160,7 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
     // libinput shares the session, so the seat can hand it device fds.
     let seat_name = config.seat.clone().unwrap_or_else(|| String::from("seat0"));
     let session = Rc::new(RefCell::new(session));
-    let mut input = Input::new(Rc::clone(&session), &seat_name)?;
+    let mut input = Input::new(Rc::clone(&session), &seat_name, config.tap_to_click)?;
 
     let drm_afd = AsyncFd::new(WatchedFd(scanout.drm_fd()))?;
     let input_afd = AsyncFd::new(WatchedFd(input.poll_fd()))?;

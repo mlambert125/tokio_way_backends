@@ -11,8 +11,9 @@ use input::event::pointer::{
     Axis, ButtonState as LiButtonState, PointerEventTrait, PointerScrollEvent,
 };
 use input::event::touch::{TouchEventPosition, TouchEventSlot, TouchEventTrait};
-use input::event::{Event, KeyboardEvent, PointerEvent, TouchEvent};
+use input::event::{DeviceEvent, Event, EventTrait, KeyboardEvent, PointerEvent, TouchEvent};
 use input::{Libinput, LibinputInterface};
+use tracing::warn;
 
 use crate::input::{ButtonState, KeyState, MouseButton, ScrollSource};
 use crate::messages::BackendMessage;
@@ -51,6 +52,11 @@ impl LibinputInterface for SeatInterface {
 pub struct Input {
     /// The libinput handle, which is also its own event iterator.
     libinput: Libinput,
+    /// Whether a tap on a touchpad is a click. `None` leaves each device on
+    /// libinput's own default. Held here rather than applied once at startup
+    /// because devices keep arriving — hot-plug, and every reopen after a VT
+    /// switch — and each arrival resets the device to its defaults.
+    tap_to_click: Option<bool>,
 }
 
 impl Input {
@@ -59,7 +65,11 @@ impl Input {
     /// # Errors
     ///
     /// If the seat cannot be assigned, or the session has no authority over it.
-    pub fn new(session: Rc<RefCell<Session>>, seat_name: &str) -> anyhow::Result<Self> {
+    pub fn new(
+        session: Rc<RefCell<Session>>,
+        seat_name: &str,
+        tap_to_click: Option<bool>,
+    ) -> anyhow::Result<Self> {
         let interface = SeatInterface {
             session,
             devices: HashMap::new(),
@@ -68,7 +78,10 @@ impl Input {
         libinput
             .udev_assign_seat(seat_name)
             .map_err(|()| anyhow::anyhow!("could not assign libinput to seat {seat_name}"))?;
-        Ok(Self { libinput })
+        Ok(Self {
+            libinput,
+            tap_to_click,
+        })
     }
 
     /// The fd to wait on. Readable when libinput has events for [`Self::dispatch`].
@@ -118,9 +131,31 @@ impl Input {
             .map_err(|e| anyhow::anyhow!("libinput dispatch failed: {e}"))?;
         let mut messages = Vec::new();
         for event in self.libinput.by_ref() {
+            // A device arriving — at startup, on hot-plug, or reopened after
+            // a VT switch — comes up with its defaults; configure it here so
+            // all three paths get the same treatment.
+            if matches!(&event, Event::Device(DeviceEvent::Added(_))) {
+                configure_device(&mut event.device(), self.tap_to_click);
+            }
             translate(&event, output_size, &mut messages);
         }
         Ok(messages)
+    }
+}
+
+/// Apply the configured input preferences to a device that just appeared.
+fn configure_device(device: &mut input::Device, tap_to_click: Option<bool>) {
+    // A nonzero tap finger count is how libinput says the device has
+    // tap-to-click to configure; on anything else — mice, keyboards —
+    // setting it would only earn an error.
+    if let Some(tap) = tap_to_click
+        && device.config_tap_finger_count() > 0
+        && let Err(e) = device.config_tap_set_enabled(tap)
+    {
+        warn!(
+            "could not set tap-to-click={tap} on {}: {e:?}",
+            device.name()
+        );
     }
 }
 
@@ -142,8 +177,9 @@ fn translate(event: &Event, output_size: (i32, i32), out: &mut Vec<BackendMessag
         Event::Pointer(pointer) => translate_pointer(pointer, out),
         Event::Touch(touch) => translate_touch(touch, output_size, out),
         // Devices coming and going, gestures, tablets, switches: not yet
-        // mapped. Seat capabilities are reported once at startup rather than
-        // tracked per device — see the run loop.
+        // mapped. (A device's arrival is configured in `dispatch`, but
+        // produces no message.) Seat capabilities are reported once at
+        // startup rather than tracked per device — see the run loop.
         _ => {}
     }
 }
