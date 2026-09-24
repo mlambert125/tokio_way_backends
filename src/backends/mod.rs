@@ -7,7 +7,6 @@ use tokio_util::sync::CancellationToken;
 use crate::messages::{BackendMessage, BackendRequest};
 use crate::scene_graph::SceneGraph;
 
-#[cfg(feature = "drm")]
 pub mod drm;
 pub mod null;
 pub mod winit;

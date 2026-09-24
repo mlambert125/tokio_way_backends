@@ -586,9 +586,6 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Shutdown => {
                 event_loop.exit();
             }
-            // Only a nudge: the frame stays in the slot until the host says
-            // a drawn frame will be shown, and several nudges coalesce into
-            // the one redraw that follows.
             UserEvent::FrameReady => self.ask_for_a_frame(),
             UserEvent::Request(BackendRequest::ProbeDmabuf) => self.answer_dmabuf_probe(),
             UserEvent::Request(BackendRequest::ImportDmabuf { token, image }) => {

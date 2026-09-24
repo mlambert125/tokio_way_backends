@@ -1,16 +1,4 @@
-//! libinput, translated into the backend message stream.
-//!
-//! libinput turns raw evdev into the events a compositor actually wants —
-//! acceleration applied, tap-to-click resolved, scroll sources
-//! distinguished — and this wraps it so the output is the same
-//! [`BackendMessage`] stream the winit and null backends produce. A
-//! compositor reading the channel cannot tell which backend filled it.
-//!
-//! The device fds come through the same [`Session`] the DRM node did: libinput
-//! asks for a device by path, and the seat hands back one this process could
-//! not open itself. The fd libinput is given is a dup of the seat's, so
-//! libinput owning and closing it never disturbs the seat's own token, which
-//! is what actually gets returned to the seat when the device goes away.
+//! libinput utilities and translation to backend messages
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,14 +20,11 @@ use crate::monotonic_timestamp::MonotonicTimeStamp;
 
 use super::session::Session;
 
-/// The bridge libinput calls to open and close device fds, backed by the
-/// seat.
+/// Seat interface
 struct SeatInterface {
-    /// The session every device is opened through, shared with the loop.
+    /// The session every device is opened through
     session: Rc<RefCell<Session>>,
-    /// The seat tokens for the fds libinput holds, keyed by the raw fd of
-    /// the dup libinput was given. The token, not the fd, is what the seat
-    /// wants back — this is where it waits until libinput lets go.
+    /// The seat tokens for the fds libinput holds
     devices: HashMap<RawFd, libseat::Device>,
 }
 
@@ -47,8 +32,6 @@ impl LibinputInterface for SeatInterface {
     fn open_restricted(&mut self, path: &Path, _flags: i32) -> Result<OwnedFd, i32> {
         let mut session = self.session.borrow_mut();
         let device = session.open_device(path).map_err(|_| -libc::EACCES)?;
-        // A dup, so libinput's close cannot close the seat's own fd. Both
-        // share one open file description, so libinput's evdev ioctls work.
         let owned = device
             .as_fd()
             .try_clone_to_owned()
@@ -61,7 +44,6 @@ impl LibinputInterface for SeatInterface {
         if let Some(device) = self.devices.remove(&fd.as_raw_fd()) {
             self.session.borrow_mut().close_device(device);
         }
-        // `fd`, the dup, closes here.
     }
 }
 
@@ -72,11 +54,11 @@ pub struct Input {
 }
 
 impl Input {
-    /// Start libinput on a seat, discovering its devices through udev.
+    /// Start libinput on a seat, discovering its devices through udev
     ///
     /// # Errors
-    /// If the seat cannot be assigned — no such seat, or the session has no
-    /// authority over it.
+    ///
+    /// If the seat cannot be assigned, or the session has no authority over it.
     pub fn new(session: Rc<RefCell<Session>>, seat_name: &str) -> anyhow::Result<Self> {
         let interface = SeatInterface {
             session,
@@ -89,8 +71,7 @@ impl Input {
         Ok(Self { libinput })
     }
 
-    /// The fd to wait on. Readable when libinput has events for
-    /// [`Self::dispatch`].
+    /// The fd to wait on. Readable when libinput has events for [`Self::dispatch`].
     ///
     /// Stable across [`Self::suspend`]/[`Self::resume`] — it is libinput's
     /// own epoll fd, not any device's — so registering it once is enough.
@@ -264,9 +245,6 @@ fn translate_touch(touch: &TouchEvent, output_size: (i32, i32), out: &mut Vec<Ba
             id: seat_slot(up.seat_slot()),
         }),
         TouchEvent::Cancel(_) => out.push(BackendMessage::TouchCancel),
-        // Frame marks the end of a batch of simultaneous touch points, which
-        // the compositor does not need to act on the ones above; the wildcard
-        // also covers any variant a newer libinput adds.
         _ => {}
     }
 }

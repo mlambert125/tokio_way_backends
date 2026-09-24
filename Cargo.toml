@@ -10,16 +10,6 @@ categories = ["graphics"]
 homepage = "https://github.com/mlambert125/tokio_way_backends"
 repository = "https://github.com/mlambert125/tokio_way_backends"
 
-[features]
-# The DRM/KMS + libinput backend is off by default. It links system libraries
-# at build time (libdrm, gbm, libinput, libudev, libseat) and pulls in a
-# statically-linked `libEGL` through `khronos-egl`; that EGL shadows the GLVND
-# `libEGL.so.1` a hosted (winit) backend's glutin context expects, so a build
-# that only ever wants the winit or null backend must not link it. Enable this
-# feature to build the DRM backend on bare hardware.
-default = []
-drm = ["dep:drm", "dep:gbm", "dep:input", "dep:udev", "dep:libseat", "dep:khronos-egl"]
-
 [dependencies]
 anyhow = "1.0.100"
 tracing = { version = "0.1.41" }
@@ -36,17 +26,14 @@ winit = "0.30.13"
 raw-window-handle = "0.6"
 glow = "0.16"
 
-# The DRM/KMS + libinput backend, behind the `drm` feature. These link system
-# libraries at build time (libdrm, gbm, libinput, libudev, libseat, EGL), and
-# the statically-linked EGL in particular must not reach a winit-only build —
-# see the `[features]` note above — so they are optional and pulled in only
-# when that feature is on.
-drm = { version = "0.14", optional = true }
-gbm = { version = "0.18", default-features = false, features = ["drm-support"], optional = true }
-input = { version = "0.9", optional = true }
-udev = { version = "0.9", optional = true }
-libseat = { version = "0.2", optional = true }
-khronos-egl = { version = "6", features = ["static"], optional = true }
+# The DRM/KMS + libinput backend. These link system libraries at build time
+# (libdrm, gbm, libinput, libudev, libseat, EGL).
+drm = "0.14"
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+input = "0.9"
+udev = "0.9"
+libseat = "0.2"
+khronos-egl = { version = "6", features = ["static"] }
 
 [dev-dependencies]
 # The tests also drive backends under `#[tokio::test]` and race them against
