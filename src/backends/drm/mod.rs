@@ -1,36 +1,4 @@
-//! DRM/KMS + libinput backend (bare hardware).
-//!
-//! The compositor as a login session on a Linux seat, driving the display
-//! and input devices directly — no host compositor beneath it. This is the
-//! backend a shipped compositor runs on; the winit backend is for developing
-//! against it from inside another desktop.
-//!
-//! This backend links system libraries the others do not (libdrm, gbm,
-//! libinput, libudev, libseat, EGL), so the crate as a whole builds only
-//! where those are present — see `flake.nix` for the build inputs.
-//!
-//! # Untested on hardware
-//!
-//! Every line here is compiled against the real crates but has not been run
-//! on a GPU in this repository's environment. Treat it as a careful first
-//! implementation to iterate on, not a proven one.
-//!
-//! # Shape
-//!
-//! Three pieces, tied together by a tokio event loop:
-//!
-//! - [`session`] — a seat, through libseat: the master DRM fd and the input
-//!   device fds without running as root, and the enable/disable that VT
-//!   switching turns on and off.
-//! - [`scanout`] — one DRM device: connectors and their modes, a GBM surface
-//!   fed by EGL and the shared [`GlRenderer`](crate::gl_renderer::GlRenderer),
-//!   and the page-flip loop that paces each output.
-//! - [`libinput_source`] — libinput, translated into the same
-//!   [`BackendMessage`] stream the other backends produce.
-//!
-//! Every fd the loop waits on — DRM, libinput, libseat — is registered with
-//! tokio through [`AsyncFd`], so the backend is driven by the same runtime as
-//! the channels rather than a thread of its own blocking on `poll`.
+//! DRM/KMS + libinput backend (bare hardware)
 
 pub mod libinput_source;
 pub mod scanout;
@@ -60,23 +28,15 @@ use vt_switch::{KeyAction, VtKeys};
 /// How to start the DRM backend.
 #[derive(Debug, Clone, Default)]
 pub struct DrmConfig {
-    /// The DRM device to drive, e.g. `/dev/dri/card0`. `None` picks the
-    /// first card node the seat will open.
+    /// The DRM device to drive, e.g. `/dev/dri/card0`. `None` picks the first card node
     pub device: Option<PathBuf>,
-    /// The seat name, as libseat and udev know it. `None` uses `seat0`, the
-    /// seat a single-seat machine always has.
+    /// The seat name, as libseat and udev know it. `None` uses `seat0`
     pub seat: Option<String>,
-    /// Whether a tap on a touchpad is a click. `None` leaves each device on
-    /// libinput's own default, which is usually off.
+    /// Whether a tap on a touchpad is a click. `None` leaves each device on libinput's
     pub tap_to_click: Option<bool>,
 }
 
-/// A borrowed fd registered with tokio only to be watched, never closed.
-///
-/// The seat, libinput and DRM fds are owned by those libraries; tokio's
-/// [`AsyncFd`] takes a `T: AsRawFd` and never closes it unless `T`'s drop
-/// does, and this wrapper has no drop — so registering it watches without
-/// taking ownership.
+/// A borrowed fd registered with tokio only to be watched, never closed
 struct WatchedFd(RawFd);
 
 impl AsRawFd for WatchedFd {
@@ -85,30 +45,11 @@ impl AsRawFd for WatchedFd {
     }
 }
 
-/// Run the DRM/KMS + libinput backend until cancelled.
-///
-/// The whole backend is one thread's worth of `!Send` state — the GL context,
-/// libseat, libinput — so this future is `!Send`. Run it on a current-thread
-/// tokio runtime with IO enabled, on a thread of its own:
-///
-/// ```no_run
-/// # use tokio_way_backends::backends::{BackendChannels, drm::{run_drm_backend, DrmConfig}};
-/// # fn go(channels: BackendChannels) {
-/// std::thread::spawn(move || {
-///     let rt = tokio::runtime::Builder::new_current_thread()
-///         .enable_all()
-///         .build()
-///         .unwrap();
-///     rt.block_on(run_drm_backend(DrmConfig::default(), channels))
-/// });
-/// # }
-/// ```
+/// Run the DRM/KMS + libinput backend until cancelled
 ///
 /// # Errors
-/// If no seat, device, or output can be brought up. Once running, per-frame
-/// failures are logged and the loop continues.
-// One `select!` over every source the backend waits on; the length is the
-// number of arms, not the complexity of any one.
+///
+/// If no seat, device, or output can be opened
 #[allow(clippy::too_many_lines)]
 pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> anyhow::Result<()> {
     let BackendChannels {
@@ -119,8 +60,6 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
         cancel,
     } = channels;
 
-    // The seat first: without it there is no device to open. Wait for the
-    // first enable before touching hardware.
     let mut session = Session::open()?;
     let seat_raw = session.poll_fd()?;
     let seat_afd = AsyncFd::new(WatchedFd(seat_raw))?;
@@ -134,19 +73,15 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
         }
     }
 
-    // The device, and the outputs it lights.
     let device_path = choose_device(&config)?;
     info!("opening DRM device {}", device_path.display());
     let drm_device = session.open_device(&device_path)?;
     let mut scanout = Scanout::open(drm_device)?;
 
-    // Everything a connecting client will be told, then the go-ahead.
     let _ = messages
         .send(BackendMessage::SeatCapabilities {
             pointer: true,
             keyboard: true,
-            // A touchscreen is reported by its first event rather than
-            // enumerated up front, as in the winit backend.
             touch: false,
         })
         .await;
@@ -157,7 +92,6 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
         .await;
     let _ = ready.send(());
 
-    // libinput shares the session, so the seat can hand it device fds.
     let seat_name = config.seat.clone().unwrap_or_else(|| String::from("seat0"));
     let session = Rc::new(RefCell::new(session));
     let mut input = Input::new(Rc::clone(&session), &seat_name, config.tap_to_click)?;
@@ -165,27 +99,22 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
     let drm_afd = AsyncFd::new(WatchedFd(scanout.drm_fd()))?;
     let input_afd = AsyncFd::new(WatchedFd(input.poll_fd()))?;
 
-    // The first turn of every output's pacing loop: nothing is composed until
-    // it is asked for.
     for id in scanout.output_ids() {
-        let _ = messages.send(frame_request(id, scanout.refresh_ns(id))).await;
+        let _ = messages
+            .send(frame_request(id, scanout.refresh_ns(id)))
+            .await;
     }
 
-    // Per-output serial last drawn, and the cursor serial, exactly as the
-    // winit backend tracks them.
     let mut drawn: HashMap<OutputId, u64> = HashMap::new();
     let mut drawn_cursor = 0u64;
     let mut last_frame: Option<SceneGraph> = None;
 
-    // The held keys, watched for Ctrl+Alt+Fn — see [`vt_switch`].
     let mut vt_keys = VtKeys::default();
 
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
 
-            // A page flip completed: report the presentation and ask for the
-            // next frame — the hardware vblank driving the pace.
             guard = drm_afd.readable() => {
                 let mut guard = guard?;
                 match scanout.handle_events() {
@@ -206,9 +135,6 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                 guard.clear_ready();
             }
 
-            // A seat event: enable/disable runs inside dispatch. Coming back
-            // from a VT switch means the CRTC config is gone and must be
-            // rebuilt, so re-modeset and re-request every output.
             guard = seat_afd.readable() => {
                 let mut guard = guard?;
                 let was_active = session.borrow().is_active();
@@ -218,18 +144,14 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                 let now_active = session.borrow().is_active();
                 if now_active && !was_active {
                     info!("session re-enabled; re-modesetting");
-                    // The evdev fds died with the disable; this reopens the
-                    // devices through the seat — see [`Input::resume`].
+
                     if let Err(e) = input.resume() {
                         warn!("{e}");
                     }
+
                     scanout.mark_needs_modeset();
                     drawn.clear();
-                    // Put the last frame straight back on screen. Waiting for
-                    // the compositor instead means waiting for it to have a
-                    // reason to publish — and if nothing changed while the
-                    // session was away, it has none, and the user is looking
-                    // at a black screen until something does.
+
                     if let Some(frame) = &last_frame {
                         for scene in &frame.scenes {
                             let id = scene.output_id;
@@ -247,31 +169,23 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                             }
                         }
                     }
+
                     for id in scanout.output_ids() {
                         let _ = messages.send(frame_request(id, scanout.refresh_ns(id))).await;
                     }
                 }
+
                 if was_active && !now_active {
-                    // Going away: every key still down will be released on
-                    // some other VT where this process cannot see it, so the
-                    // compositor is told now — otherwise it comes back with
-                    // Ctrl and Alt stuck pressed. See [`VtKeys::release_all`].
                     for message in vt_keys.release_all() {
                         let _ = messages.send(message).await;
                     }
-                    // Input's revoked fds closed before the acknowledgment
-                    // below, so the manager hears "done" once it is true.
                     input.suspend();
                 }
-                // Unconditional, and last: a no-op unless a disable is
-                // waiting, and anything the loop had to quiesce first has
-                // been by now.
+
                 session.borrow_mut().acknowledge_disable();
                 guard.clear_ready();
             }
 
-            // Input: translated and forwarded while active. While inactive the
-            // fd is still drained, so the loop does not spin on it.
             guard = input_afd.readable() => {
                 let mut guard = guard?;
                 let active = session.borrow().is_active();
@@ -303,10 +217,6 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                 guard.clear_ready();
             }
 
-            // A new frame from the compositor: draw the outputs whose scene
-            // changed (or whose cursor moved), unless mid-flip. An immediate
-            // present — the first frame's modeset — is reported at once; a
-            // queued flip waits for its event above.
             changed = frames.changed() => {
                 if changed.is_err() {
                     break;
@@ -348,7 +258,6 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
                 last_frame = Some(frame);
             }
 
-            // A compositor request.
             request = requests.recv() => {
                 match request {
                     Some(request) => {
@@ -362,8 +271,7 @@ pub async fn run_drm_backend(config: DrmConfig, channels: BackendChannels) -> an
     Ok(())
 }
 
-/// The cursor elements over one output, or nothing if the pointer is
-/// elsewhere — this backend composites the cursor rather than using a plane.
+/// The mouse cursor elements over one output
 fn cursor_for(frame: &SceneGraph, output: OutputId) -> &[SceneElement] {
     if frame.cursor.output == Some(output) {
         &frame.cursor.elements
@@ -372,8 +280,7 @@ fn cursor_for(frame: &SceneGraph, output: OutputId) -> &[SceneElement] {
     }
 }
 
-/// A frame request predicting presentation one refresh out, as the winit
-/// backend does — a frame drawn now is shown at the next vblank.
+/// A frame request predicting presentation one refresh out
 fn frame_request(output: OutputId, refresh_ns: u32) -> BackendMessage {
     let now = MonotonicTimeStamp::now();
     let nsec = now.tv_nsec + i64::from(refresh_ns);
@@ -429,18 +336,11 @@ async fn handle_request(
                 .send(BackendMessage::CaptureResult { token, capture })
                 .await;
         }
-        // Two requests this backend does not act on, both by their own
-        // best-effort contract. Runtime mode switching is not implemented, so
-        // the startup mode stands and no `OutputChanged` follows a resize.
-        // And on hardware the cursor is the compositor's own to place, with no
-        // host to ask to confine the pointer — the relative motion a
-        // locked-pointer client consumes flows regardless of confinement.
         BackendRequest::SetOutputSize { .. } | BackendRequest::SetPointerConfinement { .. } => {}
     }
 }
 
-/// The DRM node to drive: the configured one, or the first `card*` in
-/// `/dev/dri`. The seat validates it when it is opened.
+/// The DRM node to drive from config, or the first `card*` in `/dev/dri`
 fn choose_device(config: &DrmConfig) -> anyhow::Result<PathBuf> {
     if let Some(device) = &config.device {
         return Ok(device.clone());
@@ -461,4 +361,3 @@ fn choose_device(config: &DrmConfig) -> anyhow::Result<PathBuf> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("no DRM card device in /dev/dri"))
 }
-

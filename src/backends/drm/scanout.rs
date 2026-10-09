@@ -1,28 +1,16 @@
-//! One DRM device: its outputs, and the page-flip loop that paces them.
-//!
-//! This is the hardware twin of the winit backend's window. Where winit hands
-//! its frames to a host compositor, here the frames go to a GBM surface, get
-//! wrapped in a KMS framebuffer, and are put on screen by a page flip — and
-//! the flip completing is the vblank that paces the next frame, exactly the
-//! signal `RedrawRequested` stands in for on a host.
-//!
-//! Legacy modesetting, not atomic: `set_crtc` for the first frame of an
-//! output and `page_flip` for every one after. Atomic's per-property commit
-//! is what overlay planes and tear-free reconfiguration need, and is the
-//! obvious next step; the legacy path is smaller, universally supported, and
-//! enough to drive a plain scanout output correctly.
-//!
-//! One EGL display and context and one [`GlRenderer`] serve every output on
-//! the device; each output keeps its own GBM surface, EGL window surface, and
-//! the one-or-two framebuffers a double-buffered flip has in flight.
+//! One DRM device (card) its outputs, and the page-flip loop that paces them
 
 use std::ffi::{CStr, c_void};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
 use std::ptr;
 
-use drm::control::{Device as ControlDevice, Event, Mode, ModeTypeFlags, PageFlipFlags, connector,
-    crtc, framebuffer};
-use gbm::{AsRaw, BufferObject, BufferObjectFlags, Device as GbmDevice, Format, Surface as GbmSurface};
+use drm::control::{
+    Device as ControlDevice, Event, Mode, ModeTypeFlags, PageFlipFlags, connector, crtc,
+    framebuffer,
+};
+use gbm::{
+    AsRaw, BufferObject, BufferObjectFlags, Device as GbmDevice, Format, Surface as GbmSurface,
+};
 use khronos_egl as egl;
 use libseat::Device as SeatDevice;
 use tracing::{info, warn};
@@ -37,20 +25,13 @@ use crate::outputs::{
 };
 use crate::scene_graph::{Scene, SceneElement, SceneGraph};
 
-/// `EGL_PLATFORM_GBM_KHR`, the platform enum for a display backed by a GBM
-/// device. Not in khronos-egl's constants, so spelled out from the spec.
+/// `EGL_PLATFORM_GBM_KHR`, the platform enum for a display backed by a GBM device
 const PLATFORM_GBM_KHR: egl::Enum = 0x31D7;
 
-/// The one pixel format everything here agrees on: the GBM surfaces are
-/// created with it, the EGL config is chosen by it, and `add_framebuffer`'s
-/// depth/bpp of 24/32 describe it.
+/// The pixel format for everything here
 const SCANOUT_FORMAT: Format = Format::Xrgb8888;
 
-/// A seat-opened DRM node, owning its fd through the libseat token.
-///
-/// The newtype is what lets gbm and drm-rs treat the seat's device as their
-/// own: both build on [`AsFd`], and delegating it here means one object is at
-/// once the GBM allocator and the KMS control device.
+/// A seat-opened DRM node
 struct Card {
     device: SeatDevice,
 }
@@ -62,15 +43,11 @@ impl AsFd for Card {
 }
 
 // drm-rs's traits are all-default methods over `AsFd`; the empty impls opt
-// the type in, and gbm then forwards them to `Device<Card>`.
+// the type in, and gbm then forwards them to `Device<Card>`
 impl drm::Device for Card {}
 impl ControlDevice for Card {}
 
-/// A framebuffer put on screen, and the buffer it wraps.
-///
-/// The two travel together because they die together: the KMS framebuffer
-/// must be destroyed and the GBM buffer released only once scanout has moved
-/// off them, which is a flip later.
+/// A framebuffer put on screen, and the buffer it wraps
 struct Framebuffer {
     /// The locked GBM front buffer.
     bo: BufferObject<()>,
@@ -78,8 +55,7 @@ struct Framebuffer {
     fb: framebuffer::Handle,
 }
 
-/// One output: a connector lit through a CRTC, with its own render surface
-/// and the buffers a double-buffered flip keeps in flight.
+/// One output/monitor
 struct OutputScanout {
     /// The id reported to the compositor.
     id: OutputId,
@@ -97,11 +73,9 @@ struct OutputScanout {
     front: Option<Framebuffer>,
     /// What a queued flip will show, promoted to `front` when it completes.
     pending: Option<Framebuffer>,
-    /// Whether the first frame has modeset this output. Until it has, the
-    /// output is driven by `set_crtc`; after, by `page_flip`.
+    /// Whether the first frame has modeset this output
     modeset_done: bool,
-    /// Whether a flip is queued and its event not yet seen. While true the
-    /// output must not render again — that is the one-frame-in-flight bound.
+    /// Whether a flip is queued and its event not yet seen
     awaiting_flip: bool,
     /// Frames presented, reported as the presentation sequence.
     sequence: u64,
@@ -123,15 +97,13 @@ pub struct Scanout {
     renderer: GlRenderer,
     /// The outputs, in the order they were enumerated.
     outputs: Vec<OutputScanout>,
-    /// The scale every output is reported and rendered at. Compositor policy
-    /// on real hardware; 1× until there is somewhere to configure it.
+    /// The scale every output is reported and rendered at
     scale: Scale,
 }
 
 /// The outcome of rendering an output, which decides what the loop reports.
 pub enum Presented {
-    /// The frame is already on screen — the initial modeset is synchronous —
-    /// so the presentation can be reported at once.
+    /// The frame is already on screen
     Immediately {
         /// Which output.
         output: OutputId,
@@ -140,10 +112,9 @@ pub enum Presented {
         /// The presentation sequence.
         sequence: u64,
     },
-    /// A flip is queued; the presentation is reported when its event arrives
-    /// through [`Scanout::handle_events`].
+    /// A flip is queued; the presentation is reported when its event arrives through [`Scanout::handle_events`].
     FlipQueued,
-    /// Nothing was drawn: no such output, or one still awaiting its flip.
+    /// Nothing was drawn: no such output, or one still awaiting its flip
     Skipped,
 }
 
@@ -162,16 +133,14 @@ impl Scanout {
     /// connected outputs. The DRM node arrives already opened by the seat.
     ///
     /// # Errors
-    /// If EGL will not initialise on the device, the renderer cannot be
-    /// built, or no output can be brought up.
+    ///
+    /// If EGL will not initialise on the device, the renderer cannot be built, or no output can be brought up.
     pub fn open(device: SeatDevice) -> anyhow::Result<Self> {
         let card = Card { device };
         let gbm = GbmDevice::new(card)
             .map_err(|e| anyhow::anyhow!("could not create a GBM device: {e}"))?;
 
         let egl = egl::Instance::new(egl::Static);
-        // SAFETY: the GBM device pointer is live for the display's life — the
-        // GBM device outlives this Scanout, which owns both.
         let display = unsafe {
             egl.get_platform_display(
                 PLATFORM_GBM_KHR,
@@ -196,8 +165,6 @@ impl Scanout {
             )
             .map_err(|e| anyhow::anyhow!("could not create a GLES context: {e}"))?;
 
-        // The renderer and importer both load through EGL. One closure serves
-        // both: a `&Fn` is an `FnMut`, so the same reference goes to each.
         let loader = |name: &CStr| -> *const c_void {
             name.to_str()
                 .ok()
@@ -205,25 +172,17 @@ impl Scanout {
                 .map_or(ptr::null(), |f| f as *const c_void)
         };
 
-        // A context must be current before the renderer touches GL. There is
-        // no surface yet, so bind the context with none — GLES allows a
-        // surfaceless make-current for setup on any modern Mesa driver.
         egl.make_current(display, None, None, Some(context))
             .map_err(|e| anyhow::anyhow!("could not make the GLES context current: {e}"))?;
 
-        // SAFETY: the display is the one the context was made on, current on
-        // this thread for the renderer's life.
-        let importer = match unsafe {
-            DmabufImporter::new(display.as_ptr().cast::<c_void>(), &loader)
-        } {
-            Ok(importer) => Some(importer),
-            Err(reason) => {
-                info!("dma-buf import unavailable on this device: {reason}");
-                None
-            }
-        };
-        // SAFETY: the context is current on this thread and stays so for the
-        // renderer's life.
+        let importer =
+            match unsafe { DmabufImporter::new(display.as_ptr().cast::<c_void>(), &loader) } {
+                Ok(importer) => Some(importer),
+                Err(reason) => {
+                    info!("dma-buf import unavailable on this device: {reason}");
+                    None
+                }
+            };
         let renderer = unsafe { GlRenderer::new(&loader, importer)? };
 
         let mut scanout = Self {
@@ -242,8 +201,7 @@ impl Scanout {
         Ok(scanout)
     }
 
-    /// Find every connected connector, pick a mode and a free CRTC for each,
-    /// and build its render surfaces. Laid out left to right.
+    /// Find every connected display, pick a mode and a free CRTC for each, and build its render surfaces
     fn enumerate_outputs(&mut self, config: egl::Config) -> anyhow::Result<()> {
         let resources = self
             .gbm
@@ -280,8 +238,6 @@ impl Scanout {
                     BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
                 )
                 .map_err(|e| anyhow::anyhow!("could not create a GBM surface: {e}"))?;
-            // SAFETY: the GBM surface outlives the EGL surface — both live in
-            // the OutputScanout below, surface declared to drop after.
             let egl_surface = unsafe {
                 self.egl.create_window_surface(
                     self.display,
@@ -322,7 +278,7 @@ impl Scanout {
         Ok(())
     }
 
-    /// How the compositor and its clients should see these outputs.
+    /// How the compositor and its clients should see these outputs
     #[must_use]
     pub fn output_descriptions(&self) -> Vec<Output> {
         self.outputs
@@ -331,14 +287,13 @@ impl Scanout {
             .collect()
     }
 
-    /// The DRM fd to wait on for page-flip events.
+    /// The DRM fd to wait on for page-flip events
     #[must_use]
     pub fn drm_fd(&self) -> RawFd {
         self.gbm.as_fd().as_raw_fd()
     }
 
-    /// The nominal refresh of an output in nanoseconds, for the first frame
-    /// request the loop sends before any flip has happened.
+    /// The nominal refresh of an output in nanoseconds
     #[must_use]
     pub fn refresh_ns(&self, output: OutputId) -> u32 {
         self.outputs
@@ -347,8 +302,7 @@ impl Scanout {
             .map_or(0, |o| refresh_ns_of(o.mode))
     }
 
-    /// Draw a scene for one output and put it on screen — a synchronous
-    /// modeset for the first frame, a queued page flip after.
+    /// Draw a scene for one output and put it on screen
     pub fn render_output(
         &mut self,
         output_id: OutputId,
@@ -358,8 +312,6 @@ impl Scanout {
         let Some(index) = self.outputs.iter().position(|o| o.id == output_id) else {
             return Presented::Skipped;
         };
-        // Rendering while a flip is pending would lock a third buffer and race
-        // the one on screen; the pacing forbids it, and this enforces it.
         if self.outputs[index].awaiting_flip {
             return Presented::Skipped;
         }
@@ -370,7 +322,6 @@ impl Scanout {
         };
         let (width, height) = mode.size();
 
-        // SAFETY: the surface and context belong to this display and thread.
         if let Err(e) = self.egl.make_current(
             self.display,
             Some(egl_surface),
@@ -380,8 +331,10 @@ impl Scanout {
             warn!("make_current failed for output {}: {e}", output_id.0);
             return Presented::Skipped;
         }
+
         self.renderer
             .draw(scene, cursor, u32::from(width), u32::from(height));
+
         if let Err(e) = self.egl.swap_buffers(self.display, egl_surface) {
             warn!("swap_buffers failed for output {}: {e}", output_id.0);
             return Presented::Skipped;
@@ -392,13 +345,12 @@ impl Scanout {
         };
 
         let output = &mut self.outputs[index];
+
         if output.modeset_done {
-            match self.gbm.page_flip(
-                output.crtc,
-                framebuffer.fb,
-                PageFlipFlags::EVENT,
-                None,
-            ) {
+            match self
+                .gbm
+                .page_flip(output.crtc, framebuffer.fb, PageFlipFlags::EVENT, None)
+            {
                 Ok(()) => {
                     output.pending = Some(framebuffer);
                     output.awaiting_flip = true;
@@ -419,8 +371,6 @@ impl Scanout {
                 Some(output.mode),
             ) {
                 Ok(()) => {
-                    // Synchronous: it is on screen now. The old front, if any,
-                    // is free.
                     if let Some(old) = output.front.take() {
                         self.destroy_framebuffer(old);
                     }
@@ -445,8 +395,6 @@ impl Scanout {
 
     /// Lock the surface's front buffer and wrap it in a KMS framebuffer.
     fn lock_framebuffer(&mut self, index: usize) -> Option<Framebuffer> {
-        // SAFETY: called right after swap_buffers, so a front buffer exists;
-        // the returned bo is released when the Framebuffer is destroyed.
         let bo = match unsafe { self.outputs[index].gbm_surface.lock_front_buffer() } {
             Ok(bo) => bo,
             Err(e) => {
@@ -471,14 +419,12 @@ impl Scanout {
         drop(framebuffer.bo);
     }
 
-    /// Drain the page-flip events the DRM fd has ready, advancing each output
-    /// whose flip completed and returning what to report as presented.
+    /// Drain the page-flip events the DRM fd has ready
     ///
     /// # Errors
+    ///
     /// If reading the DRM events fails.
     pub fn handle_events(&mut self) -> anyhow::Result<Vec<FlipDone>> {
-        // Collect the CRTCs first: iterating the events borrows the device,
-        // and advancing the outputs borrows it again to destroy framebuffers.
         let flipped: Vec<crtc::Handle> = self
             .gbm
             .receive_events()
@@ -494,8 +440,6 @@ impl Scanout {
             let Some(index) = self.outputs.iter().position(|o| o.crtc == crtc) else {
                 continue;
             };
-            // The buffer that was on screen is now free; what was pending is
-            // now on screen.
             let old_front = self.outputs[index].front.take();
             let pending = self.outputs[index].pending.take();
             if let Some(old) = old_front {
@@ -514,26 +458,23 @@ impl Scanout {
         Ok(done)
     }
 
-    /// Drop the textures and programs the frame no longer references — the
-    /// same cache trim the winit backend does each frame.
+    /// Drop the textures and programs the frame no longer references
     pub fn prune_caches(&mut self, frame: &SceneGraph) {
         self.renderer.prune_caches(frame);
     }
 
-    /// Effect-compile failures since the last call, to forward to the
-    /// compositor.
+    /// Effect-compile failures since the last call, to forward to the compositor
     pub fn take_effect_failures(&mut self) -> Vec<(String, String)> {
         self.renderer.take_effect_failures()
     }
 
-    /// The ids of the outputs this device drives.
+    /// The ids of the outputs this device drives
     #[must_use]
     pub fn output_ids(&self) -> Vec<OutputId> {
         self.outputs.iter().map(|o| o.id).collect()
     }
 
-    /// One output's physical size in pixels — the framebuffer size, and what
-    /// touch coordinates resolve against.
+    /// One output's physical size in pixels
     #[must_use]
     pub fn output_physical_size(&self, output: OutputId) -> Option<(i32, i32)> {
         self.outputs.iter().find(|o| o.id == output).map(|o| {
@@ -542,7 +483,7 @@ impl Scanout {
         })
     }
 
-    /// Whether an output is mid-flip and so must not be rendered again yet.
+    /// Whether an output is mid-flip and so must not be rendered again yet
     #[must_use]
     pub fn awaiting_flip(&self, output: OutputId) -> bool {
         self.outputs
@@ -551,21 +492,19 @@ impl Scanout {
             .is_some_and(|o| o.awaiting_flip)
     }
 
-    /// What this device can do with dma-bufs, for the compositor's probe.
+    /// What this device can do with dma-bufs, for the compositor's probe
     #[must_use]
     pub fn dmabuf_support(&self) -> crate::dmabuf_import::DmabufCapabilities {
         self.renderer.dmabuf_support()
     }
 
-    /// Whether this device's driver will take a client's buffer.
+    /// Whether this device's driver can/will take a client's buffer
     #[must_use]
     pub fn verify_import(&self, image: &crate::dma::DmabufImage) -> bool {
         self.renderer.verify_import(image)
     }
 
-    /// Capture what an output is showing, by re-rendering its scene offscreen
-    /// and reading it back. `None` if there is no such output or the readback
-    /// fails.
+    /// Capture what an output is showing offscreen
     pub fn capture(
         &mut self,
         output: OutputId,
@@ -577,8 +516,6 @@ impl Scanout {
             let o = &self.outputs[index];
             (o.mode, o.egl_surface)
         };
-        // A current context is all `render_to_cpu` needs — it draws into its
-        // own framebuffer — but there must be one, so bind the output's.
         self.egl
             .make_current(
                 self.display,
@@ -588,9 +525,9 @@ impl Scanout {
             )
             .ok()?;
         let (width, height) = mode.size();
-        let pixels = self
-            .renderer
-            .render_to_cpu(scene, cursor, u32::from(width), u32::from(height))?;
+        let pixels =
+            self.renderer
+                .render_to_cpu(scene, cursor, u32::from(width), u32::from(height))?;
         Some(crate::messages::CapturedFrame {
             width: u32::from(width),
             height: u32::from(height),
@@ -598,11 +535,8 @@ impl Scanout {
         })
     }
 
-    /// Forget the modeset and in-flight buffers, so the next render of each
-    /// output modesets afresh. Used when the session comes back from a VT
-    /// switch, where the kernel has torn down the CRTC configuration.
+    /// Forget the modeset and in-flight buffers, so the next render of each output modesets afresh
     pub fn mark_needs_modeset(&mut self) {
-        // Drop the framebuffers first — nothing is scanning them out now.
         let stale: Vec<Framebuffer> = self
             .outputs
             .iter_mut()
@@ -619,9 +553,7 @@ impl Scanout {
     }
 }
 
-/// A default presentation flags value for a DRM scanout: a real page flip
-/// vsyncs, uses a hardware clock, signals completion, and — since the client
-/// buffer went through the compositor's own GL composite — is not zero-copy.
+/// A default presentation flags value for a DRM scanout
 #[must_use]
 pub fn scanout_flags() -> PresentationFlags {
     PresentationFlags {
@@ -632,23 +564,13 @@ pub fn scanout_flags() -> PresentationFlags {
     }
 }
 
-/// The monotonic clock reading for a presentation. The kernel reports the
-/// exact flip time in the event; reading the clock on receipt is close
-/// enough for a first implementation and avoids threading the event's
-/// timestamp through. Documented imprecision.
+/// The monotonic clock reading for a presentation
 #[must_use]
 pub fn presentation_time() -> MonotonicTimeStamp {
     MonotonicTimeStamp::now()
 }
 
-/// Choose the EGL config whose native visual is [`SCANOUT_FORMAT`].
-///
-/// The attribute list alone cannot do this: EGL attributes are minimums, and
-/// the spec sorts deeper color buffers first, so asking for 8/8/8 hands back
-/// a 10-bit config on most modern drivers. On the GBM platform Mesa then
-/// refuses `eglCreateWindowSurface` with `EGL_BAD_MATCH` unless the config's
-/// `EGL_NATIVE_VISUAL_ID` — a DRM fourcc there — equals the GBM surface's
-/// format. So every matching config is fetched and filtered on that id.
+/// Choose the EGL config whose native visual is [`SCANOUT_FORMAT`]
 fn choose_scanout_config(
     egl: &egl::Instance<egl::Static>,
     display: egl::Display,

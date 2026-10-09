@@ -52,10 +52,7 @@ impl LibinputInterface for SeatInterface {
 pub struct Input {
     /// The libinput handle, which is also its own event iterator.
     libinput: Libinput,
-    /// Whether a tap on a touchpad is a click. `None` leaves each device on
-    /// libinput's own default. Held here rather than applied once at startup
-    /// because devices keep arriving — hot-plug, and every reopen after a VT
-    /// switch — and each arrival resets the device to its defaults.
+    /// Whether a tap on a touchpad is a click, None for libinput default
     tap_to_click: Option<bool>,
 }
 
@@ -84,46 +81,32 @@ impl Input {
         })
     }
 
-    /// The fd to wait on. Readable when libinput has events for [`Self::dispatch`].
-    ///
-    /// Stable across [`Self::suspend`]/[`Self::resume`] — it is libinput's
-    /// own epoll fd, not any device's — so registering it once is enough.
+    /// The fd to wait on. This is readable when libinput has events for [`Self::dispatch`].
     #[must_use]
     pub fn poll_fd(&self) -> RawFd {
         self.libinput.as_raw_fd()
     }
 
-    /// Close every device, keeping the context to be resumed.
-    ///
-    /// For a VT switch: the moment the session is disabled the kernel
-    /// revokes every evdev fd, and a revoked fd is dead for good — it does
-    /// not come back with the enable the way the DRM fd does. Suspending
-    /// closes them while they are worthless, and [`Self::resume`] reopens
-    /// the devices through the seat afresh.
+    /// Close every device
     pub fn suspend(&mut self) {
         self.libinput.suspend();
     }
 
-    /// Reopen the devices after [`Self::suspend`], on the session's
-    /// re-enable.
+    /// Reopen the devices after [`Self::suspend`], on the session's re-enable.
     ///
     /// # Errors
-    /// If libinput cannot restart its udev monitoring; the devices it
-    /// could not reopen individually are simply absent, as they would be
-    /// after an unplug.
+    ///
+    /// If libinput cannot restart its udev monitoring
     pub fn resume(&mut self) -> anyhow::Result<()> {
         self.libinput
             .resume()
             .map_err(|()| anyhow::anyhow!("libinput could not resume after the VT switch"))
     }
 
-    /// Read whatever libinput has ready and translate it.
-    ///
-    /// `output_size` is the physical extent touch coordinates are resolved
-    /// against — libinput reports touch as a fraction of a screen. For now
-    /// the first output's size; multi-output touch mapping is not done.
+    /// Read whatever libinput has ready and translate it
     ///
     /// # Errors
+    ///
     /// If libinput's own dispatch fails.
     pub fn dispatch(&mut self, output_size: (i32, i32)) -> anyhow::Result<Vec<BackendMessage>> {
         self.libinput
@@ -131,9 +114,6 @@ impl Input {
             .map_err(|e| anyhow::anyhow!("libinput dispatch failed: {e}"))?;
         let mut messages = Vec::new();
         for event in self.libinput.by_ref() {
-            // A device arriving — at startup, on hot-plug, or reopened after
-            // a VT switch — comes up with its defaults; configure it here so
-            // all three paths get the same treatment.
             if matches!(&event, Event::Device(DeviceEvent::Added(_))) {
                 configure_device(&mut event.device(), self.tap_to_click);
             }
@@ -145,9 +125,6 @@ impl Input {
 
 /// Apply the configured input preferences to a device that just appeared.
 fn configure_device(device: &mut input::Device, tap_to_click: Option<bool>) {
-    // A nonzero tap finger count is how libinput says the device has
-    // tap-to-click to configure; on anything else — mice, keyboards —
-    // setting it would only earn an error.
     if let Some(tap) = tap_to_click
         && device.config_tap_finger_count() > 0
         && let Err(e) = device.config_tap_set_enabled(tap)
@@ -165,8 +142,6 @@ fn translate(event: &Event, output_size: (i32, i32), out: &mut Vec<BackendMessag
         Event::Keyboard(KeyboardEvent::Key(key)) => {
             out.push(BackendMessage::KeyInput {
                 time: usec_to_timestamp(key.time_usec()),
-                // libinput reports the evdev code; xkb — and the compositor's
-                // keymap — want it plus eight.
                 keycode: key.key() + 8,
                 state: match key.key_state() {
                     LiKeyState::Pressed => KeyState::Pressed,
@@ -176,10 +151,6 @@ fn translate(event: &Event, output_size: (i32, i32), out: &mut Vec<BackendMessag
         }
         Event::Pointer(pointer) => translate_pointer(pointer, out),
         Event::Touch(touch) => translate_touch(touch, output_size, out),
-        // Devices coming and going, gestures, tablets, switches: not yet
-        // mapped. (A device's arrival is configured in `dispatch`, but
-        // produces no message.) Seat capabilities are reported once at
-        // startup rather than tracked per device — see the run loop.
         _ => {}
     }
 }
@@ -227,9 +198,6 @@ fn translate_pointer(pointer: &PointerEvent, out: &mut Vec<BackendMessage>) {
             let time = usec_to_timestamp(scroll.time_usec());
             let dx = scroll.scroll_value(Axis::Horizontal);
             let dy = scroll.scroll_value(Axis::Vertical);
-            // libinput signals the end of a two-finger scroll with a zero
-            // event, which is the touchpad lifting — information a client
-            // cannot infer from deltas.
             if dx == 0.0 && dy == 0.0 {
                 out.push(BackendMessage::MouseScrollEnd { time });
             } else {
@@ -243,8 +211,6 @@ fn translate_pointer(pointer: &PointerEvent, out: &mut Vec<BackendMessage>) {
                 });
             }
         }
-        // Button and continuous scroll sources: treated as finger-like
-        // smooth scrolling, no detents.
         PointerEvent::ScrollContinuous(scroll) => {
             out.push(BackendMessage::MouseScroll {
                 time: usec_to_timestamp(scroll.time_usec()),
@@ -259,7 +225,7 @@ fn translate_pointer(pointer: &PointerEvent, out: &mut Vec<BackendMessage>) {
     }
 }
 
-/// Touch downs, moves, ups, and cancels.
+/// Touch downs, moves, ups, and cancels
 fn translate_touch(touch: &TouchEvent, output_size: (i32, i32), out: &mut Vec<BackendMessage>) {
     #[allow(clippy::cast_sign_loss)]
     let (width, height) = (output_size.0.max(1) as u32, output_size.1.max(1) as u32);
@@ -285,15 +251,13 @@ fn translate_touch(touch: &TouchEvent, output_size: (i32, i32), out: &mut Vec<Ba
     }
 }
 
-/// A libinput seat slot as the wire's finger id. Slots start at zero and are
-/// small, so the cast never loses one.
+/// A libinput seat slot
 #[allow(clippy::cast_possible_wrap)]
 fn seat_slot(slot: u32) -> i32 {
     slot as i32
 }
 
-/// A `CLOCK_MONOTONIC` microsecond reading — libinput's clock — as the
-/// timestamp the protocol carries. Same clock, so no conversion beyond units.
+/// A `CLOCK_MONOTONIC` microsecond reading
 fn usec_to_timestamp(usec: u64) -> MonotonicTimeStamp {
     MonotonicTimeStamp {
         tv_sec: i64::try_from(usec / 1_000_000).unwrap_or(0),

@@ -8,7 +8,7 @@ over channels and nothing else — it publishes scenes to draw, and receives
 input events, output descriptions, presentation feedback, and answers to its
 questions. The crate provides the shared vocabulary (scene graph, messages,
 output and buffer types), a GLES 3.0 renderer with dma-buf import, shm pool
-mapping hardened against client truncation, and two backends:
+mapping hardened against client truncation, and three backends:
 
 - **winit** — runs the compositor as a window on a host compositor.
   Development mode: your compositor is a nested window on your desktop.
